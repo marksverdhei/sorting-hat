@@ -5,6 +5,7 @@ set -euo pipefail
 
 LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8080}"
 HAT_MODEL="${HAT_MODEL:-gpt-4o}"
+REASONING_BUDGET="${HAT_REASONING_BUDGET:-1024}"
 
 usage() {
   cat <<'HELP'
@@ -15,30 +16,32 @@ Works with any OpenAI-compatible API — local (llama.cpp, Ollama, vLLM)
 or cloud (OpenAI, Anthropic via proxy, etc).
 
 Usage:
-  hat <file> [file...]        Suggest filenames for one or more files
-  hat --rename <file>         Suggest and rename (with confirmation)
-  hat --batch <dir>           Suggest names for all files in a directory
-  hat --image <file>          Describe and name an image file
-  hat --dry-run <file>        Show suggestion without prompting to rename
+  hat <file> [file...]        Suggest and prompt to rename
+  hat -y <file>               Auto-rename without confirmation
+  hat --dry-run <file>        Show suggestion without renaming
+  hat --batch <dir>           Process all files in a directory
+  hat --image <file>          Use vision model for image files
   hat --quiet <file>          No animation, just print the name
 
 Options:
-  --rename, -r    Prompt to rename the file
+  --yes, -y       Auto-rename without confirmation
   --batch, -b     Process all files in a directory
-  --image, -i     Force image mode (vision) for a file
-  --dry-run, -n   Just show suggestions, no rename prompt
+  --image, -i     Use vision model for image files
+  --dry-run, -n   Just show suggestions, no rename
   --quiet, -q     Suppress animation (for scripting)
   --ext, -e       Preserve original extension (default: true)
   --no-ext        Let the model choose the extension too
+  --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
 
 Environment:
-  LLM_BASE_URL    OpenAI-compatible base URL (default: http://localhost:8080)
-  HAT_MODEL      Model name to use (default: gpt-4o)
-  HAT_API_KEY    API key for the LLM (optional, for cloud providers)
+  LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
+  HAT_MODEL                Model name to use (default: gpt-4o)
+  HAT_API_KEY              API key for the LLM (optional, for cloud providers)
+  HAT_REASONING_BUDGET     Reasoning token budget (default: 1024)
 
 Examples:
   hat report.txt
-  hat --rename IMG_20240301_143022.jpg
+  hat -y IMG_20240301_143022.jpg
   hat --batch ~/Downloads/
   hat --image screenshot.png
 
@@ -47,6 +50,9 @@ Examples:
 
   # With OpenAI
   LLM_BASE_URL=https://api.openai.com HAT_MODEL=gpt-4o HAT_API_KEY=sk-... hat file.txt
+
+  # With HuggingFace Inference
+  LLM_BASE_URL=https://api-inference.huggingface.co/models/Qwen/Qwen2.5-72B-Instruct HAT_API_KEY=hf_... hat file.txt
 HELP
   exit 0
 }
@@ -81,23 +87,34 @@ build_payload() {
 
   if [[ "$mode" == "image" ]]; then
     python3 -c "
-import json, base64, sys
+import json, base64, sys, io
 file, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3]
-with open(file, 'rb') as f:
-    b64 = base64.b64encode(f.read()).decode()
+budget = int(sys.argv[4])
 ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
-mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
-        'gif':'image/gif','webp':'image/webp','bmp':'image/bmp',
-        'tiff':'image/tiff','tif':'image/tiff','svg':'image/svg+xml'
-       }.get(ext, 'image/jpeg')
-print(json.dumps({
-    'model': model, 'stream': True, 'max_tokens': 2048, 'temperature': 0.3,
+# Some backends (e.g. llama.cpp) only support PNG/JPEG — convert other formats
+if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
+    from PIL import Image
+    img = Image.open(file).convert('RGB')
+    buf = io.BytesIO()
+    img.save(buf, format='PNG')
+    b64 = base64.b64encode(buf.getvalue()).decode()
+    mime = 'image/png'
+else:
+    with open(file, 'rb') as f:
+        b64 = base64.b64encode(f.read()).decode()
+    mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
+            'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
+payload = {
+    'model': model, 'stream': True, 'temperature': 0.3,
     'messages': [{'role': 'user', 'content': [
         {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
         {'type': 'text', 'text': prompt}
     ]}]
-}))
-" "$file" "$prompt" "$HAT_MODEL"
+}
+if budget >= 0:
+    payload['thinking_budget_tokens'] = budget
+print(json.dumps(payload))
+" "$file" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET"
   else
     local content
     content=$(head -c 4000 "$file" 2>/dev/null)
@@ -108,12 +125,16 @@ print(json.dumps({
     python3 -c "
 import json, sys
 prompt, model = sys.argv[1], sys.argv[2]
+budget = int(sys.argv[3])
 content = sys.stdin.read()
-print(json.dumps({
-    'model': model, 'stream': True, 'max_tokens': 2048, 'temperature': 0.3,
+payload = {
+    'model': model, 'stream': True, 'temperature': 0.3,
     'messages': [{'role': 'user', 'content': prompt + '\n\nFile contents:\n' + content}]
-}))
-" "$prompt" "$HAT_MODEL" <<< "$content"
+}
+if budget >= 0:
+    payload['thinking_budget_tokens'] = budget
+print(json.dumps(payload))
+" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" <<< "$content"
   fi
 }
 
@@ -404,11 +425,6 @@ suggest_quiet() {
   local payload
   payload=$(build_payload "$file" "$mode" "$preserve_ext")
 
-  local auth_header=""
-  if [[ -n "${HAT_API_KEY:-}" ]]; then
-    auth_header="-H 'Authorization: Bearer $HAT_API_KEY'"
-  fi
-
   echo "$payload" | python3 -c "
 import json, sys, re, urllib.request, os
 
@@ -487,7 +503,7 @@ process_file() {
   # Output for scripting (stdout)
   echo "$suggested"
 
-  if [[ "$do_rename" == "true" ]]; then
+  if [[ "$do_rename" != "false" ]]; then
     local target="$dir/$suggested"
     if [[ "$target" == "$file" ]]; then
       echo "  (already named correctly)" >&2
@@ -497,16 +513,21 @@ process_file() {
       echo "  Target already exists: $target" >&2
       return 1
     fi
-    read -r -p "  Rename? [y/N] " confirm </dev/tty
-    if [[ "$confirm" =~ ^[Yy] ]]; then
+    if [[ "$do_rename" == "auto" ]]; then
       mv "$file" "$target"
       echo "  Renamed → $target" >&2
+    else
+      read -r -p "  Rename? [y/N] " confirm </dev/tty
+      if [[ "$confirm" =~ ^[Yy] ]]; then
+        mv "$file" "$target"
+        echo "  Renamed → $target" >&2
+      fi
     fi
   fi
 }
 
 # Parse args
-DO_RENAME=false
+DO_RENAME=true
 DRY_RUN=false
 BATCH=false
 FORCE_IMAGE=false
@@ -517,13 +538,14 @@ FILES=()
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --help|-h) usage ;;
-    --rename|-r) DO_RENAME=true; shift ;;
+    --yes|-y) DO_RENAME=auto; shift ;;
     --dry-run|-n) DRY_RUN=true; shift ;;
     --batch|-b) BATCH=true; shift ;;
     --image|-i) FORCE_IMAGE=true; shift ;;
     --ext|-e) PRESERVE_EXT=true; shift ;;
     --no-ext) PRESERVE_EXT=false; shift ;;
     --quiet|-q) QUIET=true; shift ;;
+    --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac
