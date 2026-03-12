@@ -34,7 +34,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Auto-detects image files by extension
 - Handles reasoning/thinking tokens from models like Qwen, DeepSeek, etc.
 - Quiet mode for scripting (`--quiet` / `-q`)
-- Disable reasoning/thinking tokens (`--nothink`) for faster inference or models that don't support them
+- Configurable reasoning: guard clause defaults to no thinking, naming uses thinking. `--nothink` disables both, `--fullthink` enables both
 - Batch processing for entire directories (processes files sequentially)
 - LLM-powered guard clause skips files that already have descriptive names using a two-turn conversation (`--force` to override)
 - Additional context for guided naming (`--context` / `-c`)
@@ -76,6 +76,7 @@ Set these environment variables (or export them in your shell profile):
 | `LLM_BASE_URL` | `http://localhost:8080` | Base URL of your OpenAI-compatible API |
 | `HAT_MODEL` | `gpt-4o` | Model name to use |
 | `HAT_API_KEY` | *(empty)* | API key (optional, for cloud providers) |
+| `HAT_REASONING_BUDGET` | `1024` | Reasoning token budget for naming (`-1` for unlimited) |
 
 ### Example configurations
 
@@ -135,8 +136,11 @@ hat --dry-run report.txt
 # Let the model choose the extension
 hat --no-ext mystery-file
 
-# Disable reasoning/thinking tokens
+# Disable reasoning/thinking tokens for both guard clause and naming
 hat --nothink photo.jpg
+
+# Enable thinking for both guard clause and naming
+hat --fullthink photo.jpg
 
 # Provide context to guide naming
 hat -c "quarterly finance report" document.pdf

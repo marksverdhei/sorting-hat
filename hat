@@ -6,6 +6,7 @@ set -euo pipefail
 LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8080}"
 HAT_MODEL="${HAT_MODEL:-gpt-4o}"
 REASONING_BUDGET="${HAT_REASONING_BUDGET:-1024}"
+GUARD_BUDGET=0  # guard clause defaults to no thinking
 
 usage() {
   cat <<'HELP'
@@ -31,8 +32,9 @@ Options:
   --quiet, -q       Suppress animation (for scripting)
   --ext, -e         Preserve original extension (default: true)
   --no-ext          Let the model choose the extension too
-  --budget, -rb     Reasoning token budget (default: 1024, -1 for unlimited)
-  --nothink         Disable thinking entirely (equivalent to --budget 0)
+  --budget, -rb     Reasoning token budget for naming (default: 1024, -1 for unlimited)
+  --nothink         Disable thinking for both guard clause and naming
+  --fullthink       Enable thinking for both guard clause and naming
   --context, -c     Additional context to guide naming (e.g. "Q3 marketing")
   --no-metadata     Don't include file metadata in LLM context
   --force, -f       Skip name quality check, always suggest a new name
@@ -85,7 +87,7 @@ is_image() {
   # BMP: 42 4d
   [[ "$magic" == 424d* ]] && return 0
   # TIFF: 49 49 2a 00 (little-endian) or 4d 4d 00 2a (big-endian)
-  [[ "$magic" == 49492a00* ]] || [[ "$magic" == 4d4d002a* ]] && return 0
+  [[ "$magic" == 49492a00* || "$magic" == 4d4d002a* ]] && return 0
   # WebP: 52 49 46 46 ... 57 45 42 50
   [[ "$magic" == 52494646* ]] && [[ "${magic:16:8}" == "57454250" ]] && return 0
   # Fall back to extension for SVG (text-based) and edge cases
@@ -94,29 +96,16 @@ is_image() {
   [[ "$ext" =~ ^(svg)$ ]]
 }
 
-# Ask the LLM if a filename already describes the file content well.
-# Returns 0 if the name needs renaming (LLM says NO), 1 if it's already good (YES).
-# Also outputs the check conversation JSON (messages array) for use as context in turn 2.
-check_filename() {
-  local file="$1" mode="$2" basename="$3" metadata="${4:-}"
-
-  local check_prompt="Look at this file's content and its current filename \"$basename\". Does the filename already accurately describe what this file contains? A good filename is specific and descriptive (e.g. 'quarterly-sales-report', 'sunset-mountain-photo'). Generic names like 'document', 'file', 'image', 'test', 'sample', or auto-generated names like 'IMG_1234', 'DSC_0001', 'Screenshot_2024' are NOT good. Reply ONLY 'YES' if the name is already descriptive, or 'NO' if it should be renamed."
-
-  if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
-    check_prompt="$check_prompt
-
-File metadata: $metadata"
-  fi
-
-  local result
-  if ! result=$(python3 - "$file" "$mode" "$check_prompt" "$HAT_MODEL" "$REASONING_BUDGET" "${LLM_BASE_URL}" "${HAT_API_KEY:-}" <<'CHECKEOF'
-import json, sys, base64, io, urllib.request, re, os
-
-file, mode, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-budget = int(sys.argv[5])
-base_url, api_key = sys.argv[6], sys.argv[7] if len(sys.argv) > 7 else ""
-
-# Build user message content
+# Encode file content as a JSON user_content value (string for text, array for images).
+# Used by check_filename, build_payload, and stream_with_hat to avoid duplication.
+# Writes JSON to a temp file and prints the path to stdout (avoids ARG_MAX for large images).
+build_user_content() {
+  local file="$1" mode="$2" prompt="$3"
+  local tmpfile
+  tmpfile=$(mktemp)
+  python3 - "$file" "$mode" "$prompt" "$tmpfile" <<'CONTENTEOF'
+import json, sys, base64, io
+file, mode, prompt, outfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
 if mode == "image":
     ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
     if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
@@ -131,19 +120,63 @@ if mode == "image":
             b64 = base64.b64encode(f.read()).decode()
         mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
                 'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
-    user_content = [
+    content = [
         {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
         {'type': 'text', 'text': prompt}
     ]
 else:
     with open(file, 'r', errors='replace') as f:
         content = f.read(4000)
-    user_content = prompt + '\n\nFile contents:\n' + content
+    content = prompt + '\n\nFile contents:\n' + content
+with open(outfile, 'w') as f:
+    json.dump(content, f)
+CONTENTEOF
+  echo "$tmpfile"
+}
+
+# Build the guard clause prompt for a given filename, with optional metadata
+build_check_prompt() {
+  local basename="$1" metadata="${2:-}"
+  local prompt="Look at this file's content and its current filename \"$basename\". Does the filename already accurately describe what this file contains? A good filename is specific and descriptive (e.g. 'quarterly-sales-report', 'sunset-mountain-photo'). Generic names like 'document', 'file', 'image', 'test', 'sample', or auto-generated names like 'IMG_1234', 'DSC_0001', 'Screenshot_2024' are NOT good. Reply ONLY 'YES' if the name is already descriptive, or 'NO' if it should be renamed."
+  if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
+    prompt="$prompt
+
+File metadata: $metadata"
+  fi
+  echo "$prompt"
+}
+
+# Ask the LLM if a filename already describes the file content well.
+# Returns 0 if the name needs renaming (LLM says NO), 1 if it's already good (YES).
+# Also outputs the check conversation JSON (messages array) for use as context in turn 2.
+check_filename() {
+  local file="$1" mode="$2" basename="$3" metadata="${4:-}"
+
+  local check_prompt
+  check_prompt=$(build_check_prompt "$basename" "$metadata")
+
+  local content_file
+  content_file=$(build_user_content "$file" "$mode" "$check_prompt")
+
+  local result
+  if ! result=$(python3 - "$content_file" "$HAT_MODEL" "$GUARD_BUDGET" "${LLM_BASE_URL}" "${HAT_API_KEY:-}" <<'CHECKEOF'
+import json, sys, urllib.request, re, os
+
+with open(sys.argv[1]) as f: user_content = json.load(f)
+os.unlink(sys.argv[1])
+model = sys.argv[2]
+budget = int(sys.argv[3])
+base_url, api_key = sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else ""
 
 messages = [{'role': 'user', 'content': user_content}]
-payload = {'model': model, 'stream': False, 'temperature': 0.1, 'max_tokens': 10, 'messages': messages}
-if budget >= 0:
-    payload['thinking_budget_tokens'] = 0  # no reasoning needed for yes/no
+payload = {'model': model, 'stream': False, 'temperature': 0.1, 'messages': messages}
+if budget > 0:
+    payload['thinking_budget_tokens'] = budget
+    payload['max_tokens'] = budget + 10
+else:
+    payload['max_tokens'] = 10
+    if budget == 0:
+        payload['thinking_budget_tokens'] = 0
 
 headers = {'Content-Type': 'application/json'}
 if api_key:
@@ -248,49 +281,37 @@ build_payload() {
 File metadata: $metadata"
   fi
 
-  python3 - "$file" "$mode" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" "$prior_messages" <<'BUILDEOF'
-import json, base64, sys, io
-
-file, mode, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-budget = int(sys.argv[5])
-prior_json = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else ""
-
-# Start with prior conversation if available (multi-turn from check_filename)
-if prior_json:
-    messages = json.loads(prior_json)
-    # Turn 2: just the naming instruction (content already in turn 1)
-    messages.append({'role': 'user', 'content': prompt})
-elif mode == "image":
-    ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
-    if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
-        from PIL import Image
-        img = Image.open(file).convert('RGB')
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        mime = 'image/png'
-    else:
-        with open(file, 'rb') as f:
-            b64 = base64.b64encode(f.read()).decode()
-        mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
-                'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
-    messages = [{'role': 'user', 'content': [
-        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
-        {'type': 'text', 'text': prompt}
-    ]}]
-else:
-    with open(file, 'r', errors='replace') as f:
-        content = f.read(4000)
-    if not content.strip():
-        print('{}')
-        sys.exit(0)
-    messages = [{'role': 'user', 'content': prompt + '\n\nFile contents:\n' + content}]
-
+  if [[ -n "$prior_messages" ]]; then
+    # Multi-turn: file content is already in turn 1, just append naming instruction
+    python3 - "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" "$prior_messages" <<'BUILDEOF'
+import json, sys
+prompt, model = sys.argv[1], sys.argv[2]
+budget, prior_json = int(sys.argv[3]), sys.argv[4]
+messages = json.loads(prior_json)
+messages.append({'role': 'user', 'content': prompt})
 payload = {'model': model, 'stream': True, 'temperature': 0.3, 'messages': messages}
 if budget >= 0:
     payload['thinking_budget_tokens'] = budget
 print(json.dumps(payload))
 BUILDEOF
+  else
+    local content_file
+    content_file=$(build_user_content "$file" "$mode" "$prompt")
+
+    python3 - "$content_file" "$HAT_MODEL" "$REASONING_BUDGET" <<'BUILDEOF'
+import json, sys, os
+with open(sys.argv[1]) as f: user_content = json.load(f)
+os.unlink(sys.argv[1])
+model, budget = sys.argv[2], int(sys.argv[3])
+if isinstance(user_content, str) and not user_content.strip():
+    print('{}'); sys.exit(0)
+messages = [{'role': 'user', 'content': user_content}]
+payload = {'model': model, 'stream': True, 'temperature': 0.3, 'messages': messages}
+if budget >= 0:
+    payload['thinking_budget_tokens'] = budget
+print(json.dumps(payload))
+BUILDEOF
+  fi
 }
 
 # Sanitize raw LLM answer into a valid filename stem
@@ -328,43 +349,25 @@ stream_with_hat() {
   # Pre-build payload files in bash so Python just streams them
   local check_tmpjson="" naming_tmpjson
   if [[ "$do_check" == "true" ]]; then
-    local check_prompt="Look at this file's content and its current filename \"$fname\". Does the filename already accurately describe what this file contains? A good filename is specific and descriptive (e.g. 'quarterly-sales-report', 'sunset-mountain-photo'). Generic names like 'document', 'file', 'image', 'test', 'sample', or auto-generated names like 'IMG_1234', 'DSC_0001', 'Screenshot_2024' are NOT good. Reply ONLY 'YES' if the name is already descriptive, or 'NO' if it should be renamed."
-    if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
-      check_prompt="$check_prompt
-
-File metadata: $metadata"
-    fi
+    local check_prompt
+    check_prompt=$(build_check_prompt "$fname" "$metadata")
     check_tmpjson=$(mktemp)
-    python3 - "$file" "$mode" "$check_prompt" "$HAT_MODEL" "$REASONING_BUDGET" > "$check_tmpjson" <<'CHECKBUILD'
-import json, sys, base64, io
-file, mode, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
-budget = int(sys.argv[5])
-if mode == "image":
-    ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
-    if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
-        from PIL import Image
-        img = Image.open(file).convert('RGB')
-        buf = io.BytesIO()
-        img.save(buf, format='PNG')
-        b64 = base64.b64encode(buf.getvalue()).decode()
-        mime = 'image/png'
-    else:
-        with open(file, 'rb') as f:
-            b64 = base64.b64encode(f.read()).decode()
-        mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
-                'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
-    user_content = [
-        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
-        {'type': 'text', 'text': prompt}
-    ]
-else:
-    with open(file, 'r', errors='replace') as f:
-        content = f.read(4000)
-    user_content = prompt + '\n\nFile contents:\n' + content
+    local check_content_file
+    check_content_file=$(build_user_content "$file" "$mode" "$check_prompt")
+    python3 - "$check_content_file" "$HAT_MODEL" "$GUARD_BUDGET" > "$check_tmpjson" <<'CHECKBUILD'
+import json, sys, os
+with open(sys.argv[1]) as f: user_content = json.load(f)
+os.unlink(sys.argv[1])
+model, budget = sys.argv[2], int(sys.argv[3])
 messages = [{'role': 'user', 'content': user_content}]
-payload = {'model': model, 'stream': True, 'temperature': 0.1, 'max_tokens': 10, 'messages': messages}
-if budget >= 0:
+payload = {'model': model, 'stream': True, 'temperature': 0.1, 'messages': messages}
+if budget > 0:
     payload['thinking_budget_tokens'] = budget
+    payload['max_tokens'] = budget + 10  # thinking + short YES/NO answer
+else:
+    payload['max_tokens'] = 10
+    if budget == 0:
+        payload['thinking_budget_tokens'] = 0
 print(json.dumps(payload))
 CHECKBUILD
   fi
@@ -509,6 +512,9 @@ def stream_request(payload_bytes, headers):
                     frame_idx += 1
                     prev_count = clear_and_draw(render_thinking(display, frame_idx, filename), prev_count)
                     last_render = now
+    # If stream ended while still inside <think> tags, the answer never arrived
+    if in_think:
+        answer_buf = ""
     return thinking_buf, answer_buf
 
 # === Setup ===
@@ -548,7 +554,10 @@ try:
         thinking_buf, answer_buf = stream_request(json.dumps(check_payload).encode(), headers)
 
         # Verdict from content only (reasoning is for thinking, not the answer)
-        answer = re.sub(r'<think>.*?</think>', '', answer_buf, flags=re.DOTALL).strip().upper()
+        # Strip complete <think> tags, and also incomplete ones (model ran out of tokens mid-think)
+        answer = re.sub(r'<think>.*?</think>', '', answer_buf, flags=re.DOTALL)
+        answer = re.sub(r'<think>.*', '', answer, flags=re.DOTALL)
+        answer = answer.strip().upper()
         verdict = 'YES' if 'YES' in answer else 'NO'
 
         if verdict == 'YES':
@@ -560,7 +569,7 @@ try:
             sys.exit(0)
         else:
             prev_count = clear_and_draw(
-                render_verdict("This name could be better...", CYAN, hat_think, filename), prev_count)
+                render_verdict("This name could be better...", CYAN, lambda: hat_think(frame_idx), filename), prev_count)
             time.sleep(1.5)
             # Build multi-turn context: inject check messages into naming payload
             check_messages.append({'role': 'assistant', 'content': 'NO'})
@@ -582,9 +591,10 @@ try:
 
     thinking_buf, answer_buf = stream_request(naming_data, headers)
 
-    # Output raw answer for bash to sanitize
+    # Output prev_count on line 1 (for reveal to clear), raw answer on line 2
     write_tty(f"\033[?25h")
     if tty: os.close(tty)
+    print(prev_count)
     print(answer_buf)
 
 except urllib.error.URLError as e:
@@ -608,27 +618,37 @@ PYEOF
     return 0
   fi
 
-  local name
-  name=$(sanitize_name "$raw_output" "$preserve_ext" "$orig_ext")
+  # Parse prev_count (line 1) and raw answer (line 2+)
+  local anim_prev_count raw_answer
+  anim_prev_count=$(echo "$raw_output" | head -1)
+  raw_answer=$(echo "$raw_output" | tail -n +2)
 
-  # Re-render the result with the final name (on tty)
+  local name
+  name=$(sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext")
+
+  # Re-render the result with the final name (on tty), clearing previous animation
   if [[ -n "$name" ]] && [[ -t 2 ]]; then
-    python3 - "$name" "$fname" <<'REVEAL'
+    python3 - "$name" "$fname" "$anim_prev_count" <<'REVEAL'
 import sys, os
 name, fname = sys.argv[1], sys.argv[2]
+prev = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
 BOLD, GREEN, YELLOW, RESET, DIM = '\033[1m', '\033[32m', '\033[33m', '\033[0m', '\033[2m'
 BUBBLE_W = 44
 tty = os.open('/dev/tty', os.O_WRONLY) if os.path.exists('/dev/tty') else None
 def w(s):
     if tty: os.write(tty, s.encode())
     else: sys.stderr.write(s); sys.stderr.flush()
+# Clear previous animation frames
+if prev > 0:
+    w(f'\033[{prev}A\033[J')
 hat = [r"        /\         ", r"       /  '.       ", r"      / .-'        ",
        r"     | ^  ^ |      ", r"     / \vv/ \      ", r"  __/````````\__   "]
-suggestion = f'I suggest: {name}'
+label = 'I suggest: '
+suggestion = label + name
 pad = BUBBLE_W - len(suggestion)
-w('\u250c' + '\u2500'*(BUBBLE_W+2) + '\u2510\n')
-w('\u2502 ' + f'{BOLD}{GREEN}{suggestion}{RESET}' + ' '*max(0,pad) + ' \u2502\n')
-w('\u2514\u2500\u2500\u2500' + '\u2500'*(BUBBLE_W-1) + '\u2518\n')
+w('  \u250c' + '\u2500'*(BUBBLE_W+2) + '\u2510\n')
+w('  \u2502 ' + f'{DIM}{label}{RESET}{BOLD}{GREEN}{name}{RESET}' + ' '*max(0,pad) + ' \u2502\n')
+w('  \u2514\u2500\u2500\u2500' + '\u2500'*(BUBBLE_W-1) + '\u2518\n')
 w('     \\\n      \\\n       |\n')
 for l in hat: w(f'  {YELLOW}{l}{RESET}\n')
 w(f'    {DIM}{fname}{RESET}\n\n')
@@ -650,29 +670,35 @@ suggest_quiet() {
   local payload
   payload=$(build_payload "$file" "$mode" "$preserve_ext" "$metadata")
 
+  local payload_file
+  payload_file=$(mktemp)
+  printf '%s\n' "$payload" > "$payload_file"
+
   local raw_answer
-  if ! raw_answer=$(echo "$payload" | python3 -c "
+  if ! raw_answer=$(python3 - "$payload_file" "${LLM_BASE_URL}" "${HAT_API_KEY:-}" <<'QUIETEOF'
 import json, sys, urllib.request, os
 
-payload = sys.stdin.read().encode()
-p = json.loads(payload)
+with open(sys.argv[1]) as f: p = json.load(f)
+os.unlink(sys.argv[1])
+base_url = sys.argv[2]
+api_key = sys.argv[3] if len(sys.argv) > 3 else ""
+
 p['stream'] = False
 payload = json.dumps(p).encode()
 
 headers = {'Content-Type': 'application/json'}
-api_key = os.environ.get('HAT_API_KEY', '')
 if api_key:
     headers['Authorization'] = f'Bearer {api_key}'
 
 req = urllib.request.Request(
-    '${LLM_BASE_URL}/v1/chat/completions',
+    f'{base_url}/v1/chat/completions',
     data=payload,
     headers=headers)
 try:
     with urllib.request.urlopen(req, timeout=300) as resp:
         data = json.loads(resp.read())
 except urllib.error.URLError as e:
-    print(f'error: could not reach LLM at ${LLM_BASE_URL}: {e.reason}', file=sys.stderr)
+    print(f'error: could not reach LLM at {base_url}: {e.reason}', file=sys.stderr)
     sys.exit(1)
 except Exception as e:
     print(f'error: LLM request failed: {e}', file=sys.stderr)
@@ -680,7 +706,8 @@ except Exception as e:
 
 content = data['choices'][0]['message']['content']
 print(content)
-"); then
+QUIETEOF
+); then
     return 1
   fi
 
@@ -834,7 +861,8 @@ while [[ $# -gt 0 ]]; do
     --no-ext) PRESERVE_EXT=false; shift ;;
     --quiet|-q) QUIET=true; shift ;;
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
-    --nothink) REASONING_BUDGET=0; shift ;;
+    --nothink) REASONING_BUDGET=0; GUARD_BUDGET=0; shift ;;
+    --fullthink) GUARD_BUDGET="match"; shift ;;
     --context|-c) CONTEXT="$2"; shift 2 ;;
     --no-metadata) INCLUDE_METADATA=false; shift ;;
     --force|-f) FORCE=true; shift ;;
@@ -849,6 +877,11 @@ fi
 
 if [[ "$DRY_RUN" == "true" ]]; then
   DO_RENAME=false
+fi
+
+# Resolve --fullthink: guard budget matches naming budget
+if [[ "$GUARD_BUDGET" == "match" ]]; then
+  GUARD_BUDGET="$REASONING_BUDGET"
 fi
 
 for target in "${FILES[@]}"; do

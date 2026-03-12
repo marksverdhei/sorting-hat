@@ -200,7 +200,7 @@ teardown_file() {
 @test "guard: LLM check says YES → skips file" {
   echo "YES" > "$MOCK_DIR/check_response"
   run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run '$TEST_ASSETS/sample.txt' 2>&1"
-  assert_output --partial "looks good, skipping"
+  assert_output --partial "already good, skipping"
 }
 
 @test "guard: --force skips LLM check entirely" {
