@@ -100,7 +100,7 @@ is_image() {
 check_filename() {
   local file="$1" mode="$2" basename="$3" metadata="${4:-}"
 
-  local check_prompt="Given this file and its current filename \"$basename\", is the filename already a good, descriptive name for the content? Reply ONLY 'YES' or 'NO'."
+  local check_prompt="Look at this file's content and its current filename \"$basename\". Does the filename already accurately describe what this file contains? A good filename is specific and descriptive (e.g. 'quarterly-sales-report', 'sunset-mountain-photo'). Generic names like 'document', 'file', 'image', 'test', 'sample', or auto-generated names like 'IMG_1234', 'DSC_0001', 'Screenshot_2024' are NOT good. Reply ONLY 'YES' if the name is already descriptive, or 'NO' if it should be renamed."
 
   if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
     check_prompt="$check_prompt
@@ -751,19 +751,19 @@ process_file() {
     return 0
   fi
 
-  # Output for scripting (stdout) — after dedup so scripts get the real name
-  echo "$suggested"
-
-  if [[ "$do_rename" != "false" ]]; then
-    if [[ "$do_rename" == "auto" ]]; then
+  if [[ "$do_rename" == "false" ]]; then
+    # Dry-run / scripting: output to stdout immediately
+    echo "$suggested"
+  elif [[ "$do_rename" == "auto" ]]; then
+    mv "$file" "$target"
+    echo "  Renamed → $target" >&2
+    echo "$suggested"
+  else
+    read -r -p "  Rename $basename to $suggested? [y/N] " confirm </dev/tty
+    if [[ "$confirm" =~ ^[Yy] ]]; then
       mv "$file" "$target"
       echo "  Renamed → $target" >&2
-    else
-      read -r -p "  Rename $basename to $suggested? [y/N] " confirm </dev/tty
-      if [[ "$confirm" =~ ^[Yy] ]]; then
-        mv "$file" "$target"
-        echo "  Renamed → $target" >&2
-      fi
+      echo "$suggested"
     fi
   fi
 }
