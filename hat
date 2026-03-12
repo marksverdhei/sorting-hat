@@ -64,13 +64,34 @@ HELP
 }
 
 is_binary() {
-  head -c 8192 "$1" 2>/dev/null | grep -qP '\x00'
+  # Use file(1) for reliable binary detection — checks magic bytes and content
+  local mime
+  mime=$(file --brief --mime-encoding "$1" 2>/dev/null)
+  [[ "$mime" == "binary" ]]
 }
 
+# Detect image by magic bytes first, then fall back to extension
 is_image() {
-  local ext="${1##*.}"
+  local file="$1"
+  # Check magic bytes
+  local magic
+  magic=$(head -c 16 "$file" 2>/dev/null | od -A n -t x1 -N 16 2>/dev/null | tr -d ' \n')
+  # JPEG: ff d8 ff
+  [[ "$magic" == ffd8ff* ]] && return 0
+  # PNG: 89 50 4e 47
+  [[ "$magic" == 89504e47* ]] && return 0
+  # GIF: 47 49 46 38
+  [[ "$magic" == 47494638* ]] && return 0
+  # BMP: 42 4d
+  [[ "$magic" == 424d* ]] && return 0
+  # TIFF: 49 49 2a 00 (little-endian) or 4d 4d 00 2a (big-endian)
+  [[ "$magic" == 49492a00* ]] || [[ "$magic" == 4d4d002a* ]] && return 0
+  # WebP: 52 49 46 46 ... 57 45 42 50
+  [[ "$magic" == 52494646* ]] && [[ "${magic:16:8}" == "57454250" ]] && return 0
+  # Fall back to extension for SVG (text-based) and edge cases
+  local ext="${file##*.}"
   ext="${ext,,}"
-  [[ "$ext" =~ ^(jpg|jpeg|png|gif|webp|bmp|tiff|tif|svg)$ ]]
+  [[ "$ext" =~ ^(svg)$ ]]
 }
 
 # Check if a filename looks auto-generated and needs renaming
@@ -578,8 +599,8 @@ process_file() {
   fi
 
   if [[ "$mode" == "text" ]] && is_binary "$file"; then
-    echo "  $basename: binary file, cannot analyze as text" >&2
-    return 1
+    echo "  $basename: binary file, skipping (no analyzable content)" >&2
+    return 0
   fi
 
   # Collect metadata

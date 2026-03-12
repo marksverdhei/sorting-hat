@@ -29,12 +29,17 @@ Minimal sample files for each supported (and planned) file type.
 | `sample.webp` | WebP | Mountain sunset scene |
 | `sample.svg` | SVG | Mountain sunset scene (vector) |
 
-## Documents (not yet supported)
+## Documents (not yet supported — planned via CLI parsers)
 
 | File | Type | Content |
 |------|------|---------|
 | `sample.docx` | Word | Budget proposal |
 | `sample.pptx` | PowerPoint | Empty presentation |
+
+## Data (not yet supported)
+
+| File | Type | Content |
+|------|------|---------|
 | `sample.parquet` | Parquet | Minimal data file |
 
 ## Audio (not yet supported)
@@ -47,3 +52,9 @@ Minimal sample files for each supported (and planned) file type.
 | `sample.ogg` | OGG Vorbis |
 | `sample.aac` | AAC |
 | `sample.m4a` | M4A |
+
+## Binary (should be skipped)
+
+| File | Type | Purpose |
+|------|------|---------|
+| `sample.bin` | Random binary | 512KB opaque blob — hat should skip this gracefully |
