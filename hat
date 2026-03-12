@@ -511,8 +511,22 @@ process_file() {
       return 0
     fi
     if [[ -e "$target" ]]; then
-      echo "  Target already exists: $target" >&2
-      return 1
+      # Find a unique name by appending -1, -2, etc.
+      local base ext_part counter new_suggested
+      if [[ "$suggested" == *.* ]]; then
+        base="${suggested%.*}"
+        ext_part=".${suggested##*.}"
+      else
+        base="$suggested"
+        ext_part=""
+      fi
+      counter=1
+      while [[ -e "$dir/${base}-${counter}${ext_part}" ]]; do
+        ((counter++))
+      done
+      new_suggested="${base}-${counter}${ext_part}"
+      target="$dir/$new_suggested"
+      echo "  Target existed, using: $new_suggested" >&2
     fi
     if [[ "$do_rename" == "auto" ]]; then
       mv "$file" "$target"
