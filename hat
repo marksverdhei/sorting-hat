@@ -32,6 +32,7 @@ Options:
   --ext, -e       Preserve original extension (default: true)
   --no-ext        Let the model choose the extension too
   --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
+  --nothink       Disable thinking entirely (equivalent to --budget 0)
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
@@ -546,6 +547,7 @@ while [[ $# -gt 0 ]]; do
     --no-ext) PRESERVE_EXT=false; shift ;;
     --quiet|-q) QUIET=true; shift ;;
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
+    --nothink) REASONING_BUDGET=0; shift ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac
