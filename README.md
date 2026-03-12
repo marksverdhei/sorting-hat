@@ -1,6 +1,7 @@
-# The Sorting Hat
+# Sorting Hat
 
-A command-line tool that uses AI to suggest descriptive filenames based on file contents. Features an animated ASCII Sorting Hat (Harry Potter style) that "thinks" while streaming the LLM's reasoning tokens, then reveals the suggested name.
+A command-line tool that uses AI to suggest descriptive filenames based on file contents. Features an animated ASCII Hat that "thinks" while streaming the LLM's reasoning tokens, then reveals the suggested name.
+
 
 ```
   ┌──────────────────────────────────────────────────┐
@@ -18,8 +19,13 @@ A command-line tool that uses AI to suggest descriptive filenames based on file 
   __/````````\__
     IMG_3847.jpg
 ```
-
 Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM Studio) or cloud providers (OpenAI, Together, etc).
+
+### Demo  
+
+
+![Visual demonstration of hat](./hat.gif)  
+
 
 ## Features
 
@@ -71,26 +77,19 @@ Set these environment variables (or export them in your shell profile):
 **llama.cpp** (local, default port):
 ```bash
 export LLM_BASE_URL=http://localhost:8080
-export HAT_MODEL=my-model
+export HAT_MODEL=Qwen/Qwen3.5-9b
 ```
 
 **Ollama**:
 ```bash
 export LLM_BASE_URL=http://localhost:11434
-export HAT_MODEL=llava        # for images
-export HAT_MODEL=llama3.1     # for text files
+export HAT_MODEL=Qwen/Qwen3.5-9b
 ```
 
 **vLLM**:
 ```bash
 export LLM_BASE_URL=http://localhost:8000
-export HAT_MODEL=Qwen/Qwen2.5-VL-7B-Instruct
-```
-
-**LM Studio**:
-```bash
-export LLM_BASE_URL=http://localhost:1234
-export HAT_MODEL=local-model
+export HAT_MODEL=Qwen/Qwen3.5-9b
 ```
 
 **OpenAI**:
@@ -103,7 +102,7 @@ export HAT_API_KEY=sk-...
 **Hugging Face Inference**:
 ```bash
 export LLM_BASE_URL=https://router.huggingface.co/hf-inference
-export HAT_MODEL=Qwen/Qwen2.5-VL-7B-Instruct
+export HAT_MODEL=Qwen/Qwen3.5-9b
 export HAT_API_KEY=hf_...
 ```
 
