@@ -270,7 +270,7 @@ stream_with_hat() {
   echo "$payload" > "$tmpjson"
 
   local raw_answer
-  raw_answer=$(python3 - "$LLM_BASE_URL" "$fname" "$tmpjson" "${HAT_API_KEY:-}" <<'PYEOF'
+  if ! raw_answer=$(python3 - "$LLM_BASE_URL" "$fname" "$tmpjson" "${HAT_API_KEY:-}" <<'PYEOF'
 import sys, json, re, urllib.request, textwrap, time, os
 
 url = sys.argv[1]
@@ -485,9 +485,15 @@ try:
                     prev_count = clear_and_draw(frame_lines, prev_count)
                     last_render = now
 
+except urllib.error.URLError as e:
+    write_tty(f"\033[?25h")
+    write_tty(f"\n  error: could not reach LLM at {url}: {e.reason}\n")
+    if tty is not None:
+        os.close(tty)
+    sys.exit(1)
 except Exception as e:
     write_tty(f"\033[?25h")
-    write_tty(f"\n  error: {e}\n")
+    write_tty(f"\n  error: LLM request failed: {e}\n")
     if tty is not None:
         os.close(tty)
     sys.exit(1)
@@ -499,7 +505,9 @@ if tty is not None:
     os.close(tty)
 print(raw)
 PYEOF
-)
+); then
+    return 1
+  fi
 
   local name
   name=$(sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext")
@@ -543,8 +551,8 @@ suggest_quiet() {
   payload=$(build_payload "$file" "$mode" "$preserve_ext" "$metadata")
 
   local raw_answer
-  raw_answer=$(echo "$payload" | python3 -c "
-import json, sys, re, urllib.request, os
+  if ! raw_answer=$(echo "$payload" | python3 -c "
+import json, sys, urllib.request, os
 
 payload = sys.stdin.read().encode()
 p = json.loads(payload)
@@ -560,12 +568,21 @@ req = urllib.request.Request(
     '${LLM_BASE_URL}/v1/chat/completions',
     data=payload,
     headers=headers)
-with urllib.request.urlopen(req, timeout=300) as resp:
-    data = json.loads(resp.read())
+try:
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read())
+except urllib.error.URLError as e:
+    print(f'error: could not reach LLM at ${LLM_BASE_URL}: {e.reason}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'error: LLM request failed: {e}', file=sys.stderr)
+    sys.exit(1)
 
 content = data['choices'][0]['message']['content']
 print(content)
-" 2>&1)
+"); then
+    return 1
+  fi
 
   sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext"
 }
@@ -611,11 +628,15 @@ process_file() {
 
   local suggested
   if [[ "$quiet" == "true" ]] || ! [[ -t 2 ]]; then
-    echo -n "  $basename → " >&2
-    suggested=$(suggest_quiet "$file" "$mode" "$preserve_ext" "$metadata")
-    echo "$suggested" >&2
+    if ! suggested=$(suggest_quiet "$file" "$mode" "$preserve_ext" "$metadata"); then
+      echo "  $basename: LLM request failed" >&2
+      return 1
+    fi
+    echo "  $basename → $suggested" >&2
   else
-    suggested=$(stream_with_hat "$file" "$mode" "$preserve_ext" "$metadata")
+    if ! suggested=$(stream_with_hat "$file" "$mode" "$preserve_ext" "$metadata"); then
+      return 1
+    fi
   fi
 
   if [[ -z "$suggested" ]]; then
@@ -720,7 +741,7 @@ for target in "${FILES[@]}"; do
     echo "Sorting files in $target:" >&2
     for f in "$target"/*; do
       [[ -f "$f" ]] || continue
-      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET"
+      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" || true
     done
   else
     process_file "$target" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET"
