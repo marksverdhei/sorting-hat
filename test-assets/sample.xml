@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<catalog>
+  <book id="1">
+    <title>The Sorting Hat's Guide to File Organization</title>
+    <author>A. Dumbledore</author>
+    <year>2025</year>
+    <genre>Technology</genre>
+  </book>
+  <book id="2">
+    <title>Naming Things Considered Harmful</title>
+    <author>E. Dijkstra</author>
+    <year>1968</year>
+    <genre>Computer Science</genre>
+  </book>
+</catalog>
