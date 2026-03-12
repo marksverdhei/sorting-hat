@@ -36,7 +36,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Quiet mode for scripting (`--quiet` / `-q`)
 - Disable reasoning/thinking tokens (`--nothink`) for faster inference or models that don't support them
 - Batch processing for entire directories (processes files sequentially)
-- Smart guard clause skips files that already have descriptive names (`--force` to override)
+- LLM-powered guard clause skips files that already have descriptive names using a two-turn conversation (`--force` to override)
 - Additional context for guided naming (`--context` / `-c`)
 - File metadata (EXIF, timestamps, MIME type) included in LLM context (`--no-metadata` to disable)
 - Interactive rename with confirmation
@@ -166,10 +166,10 @@ done
 
 ## How it works
 
-1. **Guard clause**: Checks if the filename already looks descriptive (skips camera defaults like `IMG_1234`, screenshots, UUIDs, etc.). Use `--force` to override.
+1. **Guard clause**: Asks the LLM whether the current filename is already descriptive. If yes, skips the file. If no, the check conversation becomes context for the naming request (two-turn multi-turn). Use `--force` to skip the check entirely.
 2. **Metadata collection**: Gathers file metadata (size, modification date, MIME type, EXIF for images) to give the LLM more context. Use `--no-metadata` to skip.
 3. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format.
-4. **LLM query**: Sends the content, metadata, and any user context (`--context`) to your configured LLM with a prompt asking for a descriptive kebab-case filename.
+4. **LLM query**: Sends the content, metadata, and any user context (`--context`) to your configured LLM with a prompt asking for a descriptive kebab-case filename. When the guard clause ran first, this becomes a multi-turn conversation with richer context.
 5. **Streaming display**: Shows the model's reasoning tokens in a speech bubble above the animated hat (supports both `reasoning_content` field and `<think>` tags).
 6. **Name sanitization**: Cleans the response into a valid filename. When preserving extensions (default), the model only generates the name stem and the original extension is appended automatically.
 
