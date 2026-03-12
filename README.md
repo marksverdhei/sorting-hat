@@ -34,10 +34,13 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Auto-detects image files by extension
 - Handles reasoning/thinking tokens from models like Qwen, DeepSeek, etc.
 - Quiet mode for scripting (`--quiet` / `-q`)
-- Disable reasoning/thinking tokens (`--nothink`) for faster inference or models that don't support them
+- Configurable reasoning: guard clause defaults to no thinking, naming uses thinking. `--nothink` disables both, `--fullthink` enables both
 - Batch processing for entire directories (processes files sequentially)
+- LLM-powered guard clause skips files that already have descriptive names using a two-turn conversation (`--force` to override)
+- Additional context for guided naming (`--context` / `-c`)
+- File metadata (EXIF, timestamps, MIME type) included in LLM context (`--no-metadata` to disable)
 - Interactive rename with confirmation
-- Preserves original file extension by default
+- Robust extension handling: isolates name stem from extension for reliable results with smaller models
 
 ## Requirements
 
@@ -45,6 +48,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Python 3.6+
 - An OpenAI-compatible LLM API endpoint
 - For image naming: a vision-capable model (e.g., GPT-4o, LLaVA, Qwen-VL)
+- Optional: `Pillow` (`pip install Pillow`) for EXIF metadata extraction from images
 
 ## Installation
 
@@ -70,8 +74,9 @@ Set these environment variables (or export them in your shell profile):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLM_BASE_URL` | `http://localhost:8080` | Base URL of your OpenAI-compatible API |
-| `HAT_MODEL` | `gpt-4o` | Model name to use |
+| `HAT_MODEL` | `Qwen3.5-9b` | Model name to use |
 | `HAT_API_KEY` | *(empty)* | API key (optional, for cloud providers) |
+| `HAT_REASONING_BUDGET` | `1024` | Reasoning token budget for naming (`-1` for unlimited) |
 
 ### Example configurations
 
@@ -96,7 +101,7 @@ export HAT_MODEL=Qwen/Qwen3.5-9b
 **OpenAI**:
 ```bash
 export LLM_BASE_URL=https://api.openai.com
-export HAT_MODEL=gpt-4o
+export HAT_MODEL=Qwen3.5-9b
 export HAT_API_KEY=sk-...
 ```
 
@@ -131,8 +136,20 @@ hat --dry-run report.txt
 # Let the model choose the extension
 hat --no-ext mystery-file
 
-# Disable reasoning/thinking tokens
+# Disable reasoning/thinking tokens for both guard clause and naming
 hat --nothink photo.jpg
+
+# Enable thinking for both guard clause and naming
+hat --fullthink photo.jpg
+
+# Provide context to guide naming
+hat -c "quarterly finance report" document.pdf
+
+# Process all files, even those with good names
+hat --batch --force ~/Downloads/
+
+# Skip metadata collection
+hat --no-metadata photo.jpg
 ```
 
 ### Scripting
@@ -153,10 +170,12 @@ done
 
 ## How it works
 
-1. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format.
-2. **LLM query**: Sends the content to your configured LLM with a prompt asking for a descriptive kebab-case filename.
-3. **Streaming display**: Shows the model's reasoning tokens in a speech bubble above the animated hat (supports both `reasoning_content` field and `<think>` tags).
-4. **Name sanitization**: Cleans the response into a valid filename (lowercase, hyphens, no special characters).
+1. **Guard clause**: Asks the LLM whether the current filename is already descriptive. If yes, skips the file. If no, the check conversation becomes context for the naming request (two-turn multi-turn). Use `--force` to skip the check entirely.
+2. **Metadata collection**: Gathers file metadata (size, modification date, MIME type, EXIF for images) to give the LLM more context. Use `--no-metadata` to skip.
+3. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format.
+4. **LLM query**: Sends the content, metadata, and any user context (`--context`) to your configured LLM with a prompt asking for a descriptive kebab-case filename. When the guard clause ran first, this becomes a multi-turn conversation with richer context.
+5. **Streaming display**: Shows the model's reasoning tokens in a speech bubble above the animated hat (supports both `reasoning_content` field and `<think>` tags).
+6. **Name sanitization**: Cleans the response into a valid filename. When preserving extensions (default), the model only generates the name stem and the original extension is appended automatically.
 
 ## The Animation
 

@@ -4,8 +4,9 @@
 set -euo pipefail
 
 LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8080}"
-HAT_MODEL="${HAT_MODEL:-gpt-4o}"
+HAT_MODEL="${HAT_MODEL:-Qwen3.5-9b}"
 REASONING_BUDGET="${HAT_REASONING_BUDGET:-1024}"
+GUARD_BUDGET=0  # guard clause defaults to no thinking
 
 usage() {
   cat <<'HELP'
@@ -24,19 +25,23 @@ Usage:
   hat --quiet <file>          No animation, just print the name
 
 Options:
-  --yes, -y       Auto-rename without confirmation
-  --batch, -b     Process all files in a directory
-  --image, -i     Use vision model for image files
-  --dry-run, -n   Just show suggestions, no rename
-  --quiet, -q     Suppress animation (for scripting)
-  --ext, -e       Preserve original extension (default: true)
-  --no-ext        Let the model choose the extension too
-  --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
-  --nothink       Disable thinking entirely (equivalent to --budget 0)
+  --yes, -y         Auto-rename without confirmation
+  --batch, -b       Process all files in a directory
+  --image, -i       Use vision model for image files
+  --dry-run, -n     Just show suggestions, no rename
+  --quiet, -q       Suppress animation (for scripting)
+  --ext, -e         Preserve original extension (default: true)
+  --no-ext          Let the model choose the extension too
+  --budget, -rb     Reasoning token budget for naming (default: 1024, -1 for unlimited)
+  --nothink         Disable thinking for both guard clause and naming
+  --fullthink       Enable thinking for both guard clause and naming
+  --context, -c     Additional context to guide naming (e.g. "Q3 marketing")
+  --no-metadata     Don't include file metadata in LLM context
+  --force, -f       Skip name quality check, always suggest a new name
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
-  HAT_MODEL                Model name to use (default: gpt-4o)
+  HAT_MODEL                Model name to use (default: Qwen3.5-9b)
   HAT_API_KEY              API key for the LLM (optional, for cloud providers)
   HAT_REASONING_BUDGET     Reasoning token budget (default: 1024)
 
@@ -45,6 +50,8 @@ Examples:
   hat -y IMG_20240301_143022.jpg
   hat --batch ~/Downloads/
   hat --image screenshot.png
+  hat -c "quarterly finance report" document.pdf
+  hat --batch --force ~/unsorted/
 
   # With Ollama
   LLM_BASE_URL=http://localhost:11434 HAT_MODEL=llava hat photo.jpg
@@ -59,155 +66,347 @@ HELP
 }
 
 is_binary() {
-  head -c 8192 "$1" 2>/dev/null | grep -qP '\x00'
+  # Use file(1) for reliable binary detection — checks magic bytes and content
+  local mime
+  mime=$(file --brief --mime-encoding "$1" 2>/dev/null)
+  [[ "$mime" == "binary" ]]
 }
 
+# Detect image by magic bytes first, then fall back to extension
 is_image() {
-  local ext="${1##*.}"
+  local file="$1"
+  # Check magic bytes
+  local magic
+  magic=$(head -c 16 "$file" 2>/dev/null | od -A n -t x1 -N 16 2>/dev/null | tr -d ' \n')
+  # JPEG: ff d8 ff
+  [[ "$magic" == ffd8ff* ]] && return 0
+  # PNG: 89 50 4e 47
+  [[ "$magic" == 89504e47* ]] && return 0
+  # GIF: 47 49 46 38
+  [[ "$magic" == 47494638* ]] && return 0
+  # BMP: 42 4d
+  [[ "$magic" == 424d* ]] && return 0
+  # TIFF: 49 49 2a 00 (little-endian) or 4d 4d 00 2a (big-endian)
+  [[ "$magic" == 49492a00* || "$magic" == 4d4d002a* ]] && return 0
+  # WebP: 52 49 46 46 ... 57 45 42 50
+  [[ "$magic" == 52494646* ]] && [[ "${magic:16:8}" == "57454250" ]] && return 0
+  # Fall back to extension for SVG (text-based) and edge cases
+  local ext="${file##*.}"
   ext="${ext,,}"
-  [[ "$ext" =~ ^(jpg|jpeg|png|gif|webp|bmp|tiff|tif|svg)$ ]]
+  [[ "$ext" =~ ^(svg)$ ]]
+}
+
+# Encode file content as a JSON user_content value (string for text, array for images).
+# Used by check_filename, build_payload, and stream_with_hat to avoid duplication.
+# Writes JSON to a temp file and prints the path to stdout (avoids ARG_MAX for large images).
+build_user_content() {
+  local file="$1" mode="$2" prompt="$3"
+  local tmpfile
+  tmpfile=$(mktemp)
+  python3 - "$file" "$mode" "$prompt" "$tmpfile" <<'CONTENTEOF'
+import json, sys, base64, io
+file, mode, prompt, outfile = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+if mode == "image":
+    ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
+    if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
+        from PIL import Image
+        img = Image.open(file).convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        mime = 'image/png'
+    else:
+        with open(file, 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode()
+        mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
+                'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
+    content = [
+        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
+        {'type': 'text', 'text': prompt}
+    ]
+else:
+    with open(file, 'r', errors='replace') as f:
+        content = f.read(4000)
+    content = prompt + '\n\nFile contents:\n' + content
+with open(outfile, 'w') as f:
+    json.dump(content, f)
+CONTENTEOF
+  echo "$tmpfile"
+}
+
+# Build the guard clause prompt for a given filename, with optional metadata
+build_check_prompt() {
+  local basename="$1" metadata="${2:-}"
+  local prompt="Look at this file's content and its current filename \"$basename\". Does the filename already accurately describe what this file contains? A good filename is specific and descriptive (e.g. 'quarterly-sales-report', 'sunset-mountain-photo'). Generic names like 'document', 'file', 'image', 'test', 'sample', or auto-generated names like 'IMG_1234', 'DSC_0001', 'Screenshot_2024' are NOT good. Reply ONLY 'YES' if the name is already descriptive, or 'NO' if it should be renamed."
+  if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
+    prompt="$prompt
+
+File metadata: $metadata"
+  fi
+  echo "$prompt"
+}
+
+# Ask the LLM if a filename already describes the file content well.
+# Returns 0 if the name needs renaming (LLM says NO), 1 if it's already good (YES).
+# Also outputs the check conversation JSON (messages array) for use as context in turn 2.
+check_filename() {
+  local file="$1" mode="$2" basename="$3" metadata="${4:-}"
+
+  local check_prompt
+  check_prompt=$(build_check_prompt "$basename" "$metadata")
+
+  local content_file
+  content_file=$(build_user_content "$file" "$mode" "$check_prompt")
+
+  local result
+  if ! result=$(python3 - "$content_file" "$HAT_MODEL" "$GUARD_BUDGET" "${LLM_BASE_URL}" "${HAT_API_KEY:-}" <<'CHECKEOF'
+import json, sys, urllib.request, re, os
+
+with open(sys.argv[1]) as f: user_content = json.load(f)
+os.unlink(sys.argv[1])
+model = sys.argv[2]
+budget = int(sys.argv[3])
+base_url, api_key = sys.argv[4], sys.argv[5] if len(sys.argv) > 5 else ""
+
+messages = [{'role': 'user', 'content': user_content}]
+payload = {'model': model, 'stream': False, 'temperature': 0.1, 'messages': messages}
+if budget > 0:
+    payload['thinking_budget_tokens'] = budget
+    payload['max_tokens'] = budget + 10
+else:
+    payload['max_tokens'] = 10
+    if budget == 0:
+        payload['thinking_budget_tokens'] = 0
+
+headers = {'Content-Type': 'application/json'}
+if api_key:
+    headers['Authorization'] = f'Bearer {api_key}'
+
+req = urllib.request.Request(f'{base_url}/v1/chat/completions',
+    data=json.dumps(payload).encode(), headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+except urllib.error.URLError as e:
+    print(f'error: could not reach LLM at {base_url}: {e.reason}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'error: LLM request failed: {e}', file=sys.stderr)
+    sys.exit(1)
+
+answer = data['choices'][0]['message']['content']
+answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip().upper()
+
+# Output: verdict on line 1, then the messages JSON for multi-turn context on line 2
+verdict = 'YES' if 'YES' in answer else 'NO'
+# Build conversation history for turn 2
+messages.append({'role': 'assistant', 'content': verdict})
+print(verdict)
+print(json.dumps(messages))
+CHECKEOF
+  ); then
+    return 2  # error
+  fi
+
+  local verdict
+  verdict=$(echo "$result" | head -1)
+  # Export the conversation context for turn 2
+  CHECK_MESSAGES=$(echo "$result" | tail -1)
+
+  if [[ "$verdict" == "YES" ]]; then
+    return 1  # name is already good
+  fi
+  return 0  # needs renaming
+}
+
+# Collect file metadata as JSON
+collect_metadata() {
+  local file="$1" mode="$2"
+  python3 -c "
+import sys, os, datetime, json, mimetypes
+file, mode = sys.argv[1], sys.argv[2]
+meta = {}
+stat = os.stat(file)
+meta['size_bytes'] = stat.st_size
+meta['modified'] = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+mime, _ = mimetypes.guess_type(file)
+if mime:
+    meta['mime_type'] = mime
+if mode == 'image':
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        exif = Image.open(file).getexif()
+        if exif:
+            ed = {}
+            for tid, val in exif.items():
+                tag = TAGS.get(tid, tid)
+                if isinstance(val, (str, int, float)):
+                    ed[str(tag)] = str(val)[:100]
+            if ed: meta['exif'] = ed
+    except Exception:
+        pass
+print(json.dumps(meta, ensure_ascii=False))
+" "$file" "$mode"
 }
 
 # Build the JSON payload for the API call, output to stdout
+# If CHECK_MESSAGES is set, uses it as conversation history (multi-turn from check_filename)
 build_payload() {
-  local file="$1"
-  local mode="$2"
-  local preserve_ext="$3"
+  local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
   local ext="${file##*.}"
+  local prior_messages="${CHECK_MESSAGES:-}"
 
-  local ext_instruction="Choose an appropriate extension."
+  local ext_instruction
   if [[ "$preserve_ext" == "true" && -n "$ext" && "$ext" != "$file" ]]; then
-    ext_instruction="Keep the extension as .$ext."
+    ext_instruction="Do NOT include any file extension in your response. Reply with ONLY the name stem."
+  else
+    ext_instruction="Choose an appropriate extension."
   fi
 
-  local prompt="You are a file naming assistant. Suggest a single appropriate filename. Rules:
+  local prompt="Suggest a single appropriate filename. Rules:
 - Use lowercase with hyphens (kebab-case), no spaces
 - Be descriptive but concise (2-5 words)
 - $ext_instruction
 - Reply with ONLY the filename, nothing else"
 
-  if [[ "$mode" == "image" ]]; then
-    python3 -c "
-import json, base64, sys, io
-file, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3]
-budget = int(sys.argv[4])
-ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
-# Some backends (e.g. llama.cpp) only support PNG/JPEG — convert other formats
-if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
-    from PIL import Image
-    img = Image.open(file).convert('RGB')
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    mime = 'image/png'
-else:
-    with open(file, 'rb') as f:
-        b64 = base64.b64encode(f.read()).decode()
-    mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
-            'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
-payload = {
-    'model': model, 'stream': True, 'temperature': 0.3,
-    'messages': [{'role': 'user', 'content': [
-        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
-        {'type': 'text', 'text': prompt}
-    ]}]
-}
-if budget >= 0:
-    payload['thinking_budget_tokens'] = budget
-print(json.dumps(payload))
-" "$file" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET"
-  else
-    local content
-    content=$(head -c 4000 "$file" 2>/dev/null)
-    if [[ -z "$content" ]]; then
-      echo '{}' # will be caught as error
-      return
-    fi
-    python3 -c "
+  if [[ -n "$CONTEXT" ]]; then
+    prompt="$prompt
+- Additional context: $CONTEXT"
+  fi
+
+  if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
+    prompt="$prompt
+
+File metadata: $metadata"
+  fi
+
+  if [[ -n "$prior_messages" ]]; then
+    # Multi-turn: file content is already in turn 1, just append naming instruction
+    python3 - "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" "$prior_messages" <<'BUILDEOF'
 import json, sys
 prompt, model = sys.argv[1], sys.argv[2]
-budget = int(sys.argv[3])
-content = sys.stdin.read()
-payload = {
-    'model': model, 'stream': True, 'temperature': 0.3,
-    'messages': [{'role': 'user', 'content': prompt + '\n\nFile contents:\n' + content}]
-}
+budget, prior_json = int(sys.argv[3]), sys.argv[4]
+messages = json.loads(prior_json)
+messages.append({'role': 'user', 'content': prompt})
+payload = {'model': model, 'stream': True, 'temperature': 0.3, 'messages': messages}
 if budget >= 0:
     payload['thinking_budget_tokens'] = budget
 print(json.dumps(payload))
-" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" <<< "$content"
+BUILDEOF
+  else
+    local content_file
+    content_file=$(build_user_content "$file" "$mode" "$prompt")
+
+    python3 - "$content_file" "$HAT_MODEL" "$REASONING_BUDGET" <<'BUILDEOF'
+import json, sys, os
+with open(sys.argv[1]) as f: user_content = json.load(f)
+os.unlink(sys.argv[1])
+model, budget = sys.argv[2], int(sys.argv[3])
+if isinstance(user_content, str) and not user_content.strip():
+    print('{}'); sys.exit(0)
+messages = [{'role': 'user', 'content': user_content}]
+payload = {'model': model, 'stream': True, 'temperature': 0.3, 'messages': messages}
+if budget >= 0:
+    payload['thinking_budget_tokens'] = budget
+print(json.dumps(payload))
+BUILDEOF
   fi
 }
 
-# Stream the LLM response with sorting hat animation on stderr, print filename on stdout
+# Sanitize raw LLM answer into a valid filename stem
+# Usage: sanitize_name RAW_ANSWER PRESERVE_EXT ORIGINAL_EXT
+sanitize_name() {
+  python3 - "$1" "$2" "$3" <<'SANITIZE'
+import re, sys
+answer, preserve_ext, orig_ext = sys.argv[1], sys.argv[2], sys.argv[3]
+answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+lines = [l.strip().strip('`"\'') for l in answer.split("\n") if l.strip()]
+name = lines[-1] if lines else ""
+name = name.split("/")[-1]
+name = re.sub(r"[^a-zA-Z0-9._-]", "-", name)
+name = re.sub(r"-+", "-", name).strip("-")
+if preserve_ext == "true" and orig_ext:
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    name = name + "." + orig_ext
+print(name)
+SANITIZE
+}
+
+# Stream the LLM response with sorting hat animation on stderr, print raw answer on stdout.
+# When do_check is "true", runs two-turn flow: guard clause (streamed) → verdict → naming (streamed).
+# Outputs: "SKIP" on stdout if name is already good, otherwise the raw LLM answer for naming.
 stream_with_hat() {
-  local file="$1"
-  local mode="$2"
-  local preserve_ext="$3"
-  local basename
-  basename=$(basename "$file")
+  local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
+  local do_check="$5"  # "true" to run guard clause first
+  local fname orig_ext=""
+  fname=$(basename "$file")
+  if [[ "$preserve_ext" == "true" && "$fname" == *.* ]]; then
+    orig_ext="${fname##*.}"
+  fi
 
-  local payload
-  payload=$(build_payload "$file" "$mode" "$preserve_ext")
+  # Pre-build payload files in bash so Python just streams them
+  local check_tmpjson="" naming_tmpjson
+  if [[ "$do_check" == "true" ]]; then
+    local check_prompt
+    check_prompt=$(build_check_prompt "$fname" "$metadata")
+    check_tmpjson=$(mktemp)
+    local check_content_file
+    check_content_file=$(build_user_content "$file" "$mode" "$check_prompt")
+    python3 - "$check_content_file" "$HAT_MODEL" "$GUARD_BUDGET" > "$check_tmpjson" <<'CHECKBUILD'
+import json, sys, os
+with open(sys.argv[1]) as f: user_content = json.load(f)
+os.unlink(sys.argv[1])
+model, budget = sys.argv[2], int(sys.argv[3])
+messages = [{'role': 'user', 'content': user_content}]
+payload = {'model': model, 'stream': True, 'temperature': 0.1, 'messages': messages}
+if budget > 0:
+    payload['thinking_budget_tokens'] = budget
+    payload['max_tokens'] = budget + 10  # thinking + short YES/NO answer
+else:
+    payload['max_tokens'] = 10
+    if budget == 0:
+        payload['thinking_budget_tokens'] = 0
+print(json.dumps(payload))
+CHECKBUILD
+  fi
 
-  local tmpjson
-  tmpjson=$(mktemp)
-  echo "$payload" > "$tmpjson"
+  # Always build the naming payload (without prior messages — Python will inject them if needed)
+  naming_tmpjson=$(mktemp)
+  CHECK_MESSAGES=""
+  build_payload "$file" "$mode" "$preserve_ext" "$metadata" > "$naming_tmpjson"
 
-  python3 - "$LLM_BASE_URL" "$basename" "$tmpjson" "${HAT_API_KEY:-}" <<'PYEOF'
+  local raw_output
+  if ! raw_output=$(python3 - "$LLM_BASE_URL" "$fname" "$do_check" "$check_tmpjson" "$naming_tmpjson" "${HAT_API_KEY:-}" <<'PYEOF'
 import sys, json, re, urllib.request, textwrap, time, os
 
 url = sys.argv[1]
 filename = sys.argv[2]
-payload_file = sys.argv[3]
-api_key = sys.argv[4] if len(sys.argv) > 4 else ""
-
-with open(payload_file) as f:
-    payload = f.read().encode()
-os.unlink(payload_file)
+do_check = sys.argv[3] == "true"
+check_file = sys.argv[4] if sys.argv[4] else ""
+naming_file = sys.argv[5]
+api_key = sys.argv[6] if len(sys.argv) > 6 else ""
 
 BUBBLE_W = 44
 
-# Sorting Hat ASCII art — proper witch's hat with wide brim
-# The face is in the crumpled band above the brim
 HAT_BODY = [
     r"        /\         ",
     r"       /  '.       ",
     r"      / .-'        ",
 ]
-
 HAT_THINK_FACES = [
-    [r"     | o  o |      ", r"     / ~~~~ \      "],  # frame 0
-    [r"     | -  o |      ", r"     / ~~~~ \      "],  # frame 1
-    [r"     | o  - |      ", r"     / ---- \      "],  # frame 2
-    [r"     | o  o |      ", r"     / ---- \      "],  # frame 3
+    [r"     | o  o |      ", r"     / ~~~~ \      "],
+    [r"     | -  o |      ", r"     / ~~~~ \      "],
+    [r"     | o  - |      ", r"     / ---- \      "],
+    [r"     | o  o |      ", r"     / ---- \      "],
 ]
-
 HAT_HAPPY_FACE = [r"     | ^  ^ |      ", r"     / \vv/ \      "]
-
+HAT_SATISFIED_FACE = [r"     | -  - |      ", r"     / \vv/ \      "]
 HAT_BRIM = r"  __/````````\__   "
 
-def hat_think(frame_idx):
-    face = HAT_THINK_FACES[frame_idx % len(HAT_THINK_FACES)]
-    return HAT_BODY + face + [HAT_BRIM]
-
-def hat_happy():
-    return HAT_BODY + HAT_HAPPY_FACE + [HAT_BRIM]
-
-HAT_H = len(HAT_BODY) + 2 + 1  # body + face + brim
-
-HAT_DROP_FRAMES = []
-_full = hat_think(0)
-_pad = len(_full)
-for offset in range(4, 0, -1):
-    frame = ["                    "] * offset + _full + ["                    "] * (4 - offset)
-    HAT_DROP_FRAMES.append(frame)
-
-DIM = "\033[2m"
-BOLD = "\033[1m"
-RESET = "\033[0m"
-YELLOW = "\033[33m"
-GREEN = "\033[32m"
+DIM, BOLD, RESET = "\033[2m", "\033[1m", "\033[0m"
+YELLOW, GREEN, CYAN = "\033[33m", "\033[32m", "\033[36m"
 
 tty = os.open("/dev/tty", os.O_WRONLY) if os.path.exists("/dev/tty") else None
 
@@ -215,142 +414,80 @@ def write_tty(s):
     if tty is not None:
         os.write(tty, s.encode())
     else:
-        sys.stderr.write(s)
-        sys.stderr.flush()
+        sys.stderr.write(s); sys.stderr.flush()
 
 def wrap_text(text, width):
-    if not text:
-        return [""]
+    if not text: return [""]
     lines = []
-    for paragraph in text.split('\n'):
-        if not paragraph.strip():
-            lines.append("")
-            continue
-        wrapped = textwrap.wrap(paragraph, width=width, break_long_words=True, break_on_hyphens=True)
-        lines.extend(wrapped if wrapped else [""])
+    for p in text.split('\n'):
+        if not p.strip(): lines.append(""); continue
+        lines.extend(textwrap.wrap(p, width=width, break_long_words=True, break_on_hyphens=True) or [""])
     return lines
 
 def render_bubble(lines, width, tail=False):
-    out = []
-    out.append("  \u250c" + "\u2500" * (width + 2) + "\u2510")
+    out = ["  \u250c" + "\u2500" * (width + 2) + "\u2510"]
     for line in lines:
         out.append("  \u2502 " + line.ljust(width) + " \u2502")
     if tail:
-        # Bottom with smooth diagonal tail
-        out.append("  \u2514\u2500\u2500\u2500" + "\u2500" * (width - 1) + "\u2518")
-        out.append("     \\")
-        out.append("      \\")
-        out.append("       |")
+        out += ["  \u2514\u2500\u2500\u2500" + "\u2500" * (width - 1) + "\u2518", "     \\", "      \\", "       |"]
     else:
         out.append("  \u2514" + "\u2500" * (width + 2) + "\u2518")
     return out
 
-def render_thinking(thinking_text, frame_idx, fname):
-    """Render: speech bubble + hat + filename shelf."""
-    hat_lines = hat_think(frame_idx)
+def hat_think(fi):
+    return HAT_BODY + HAT_THINK_FACES[fi % len(HAT_THINK_FACES)] + [HAT_BRIM]
 
-    all_lines = wrap_text(thinking_text, BUBBLE_W)
+def hat_happy():
+    return HAT_BODY + HAT_HAPPY_FACE + [HAT_BRIM]
+
+def hat_satisfied():
+    return HAT_BODY + HAT_SATISFIED_FACE + [HAT_BRIM]
+
+def render_thinking(text, fi, fname):
+    all_lines = wrap_text(text, BUBBLE_W)
     visible = all_lines[-3:] if len(all_lines) > 3 else all_lines
-    while len(visible) < 2:
-        visible.insert(0, "")
-    bubble = render_bubble(visible, BUBBLE_W, tail=True)
-
-    out = bubble
-    out += [f"  {YELLOW}{line}{RESET}" for line in hat_lines]
+    while len(visible) < 2: visible.insert(0, "")
+    out = render_bubble(visible, BUBBLE_W, tail=True)
+    out += [f"  {YELLOW}{l}{RESET}" for l in hat_think(fi)]
     out.append(f"    {DIM}{fname}{RESET}")
     return out
 
-def render_result(name, fname):
-    """Render final: hat happy + new name."""
-    pad = BUBBLE_W - len(name)
-    bubble = render_bubble(["PLACEHOLDER"], BUBBLE_W, tail=True)
-    bubble[1] = f"  \u2502 {BOLD}{GREEN}{name}{RESET}" + " " * max(0, pad) + " \u2502"
-
-    hat_lines = hat_happy()
-    out = bubble
-    out += [f"  {YELLOW}{line}{RESET}" for line in hat_lines]
-    out.append(f"    {BOLD}{GREEN}{name}{RESET}")
+def render_verdict(text, color, hat_fn, fname):
+    pad = BUBBLE_W - len(text)
+    bubble = render_bubble(["X"], BUBBLE_W, tail=True)
+    bubble[1] = f"  \u2502 {BOLD}{color}{text}{RESET}" + " " * max(0, pad) + " \u2502"
+    out = bubble + [f"  {YELLOW}{l}{RESET}" for l in hat_fn()]
+    out.append(f"    {DIM}{fname}{RESET}")
     return out
 
-def clear_and_draw(lines, prev_line_count):
-    if prev_line_count > 0:
-        write_tty(f"\033[{prev_line_count}A")
-        write_tty("\033[J")
-    for line in lines:
-        write_tty(line + "\n")
+def clear_and_draw(lines, prev):
+    if prev > 0:
+        write_tty(f"\033[{prev}A\033[J")
+    for l in lines: write_tty(l + "\n")
     return len(lines)
 
-# === Drop animation ===
-write_tty("\033[?25l")  # hide cursor
+def stream_request(payload_bytes, headers):
+    """Stream an LLM request with realtime animation. Returns (thinking, answer)."""
+    global prev_count, frame_idx
+    req = urllib.request.Request(f"{url}/v1/chat/completions", data=payload_bytes, headers=headers)
+    thinking_buf, answer_buf, in_think, last_render = "", "", False, 0
 
-# Reserve space and show filename
-total_h = 17  # bubble(4) + arrow(3) + hat(6) + shelf(2) + padding(2)
-write_tty("\n" * total_h)
-write_tty(f"\033[{total_h}A")  # go back up
-prev_count = 0
-
-for i, drop_frame in enumerate(HAT_DROP_FRAMES):
-    frame = []
-    for line in drop_frame:
-        frame.append(f"  {YELLOW}{line}{RESET}")
-    # Pad to fixed height
-    while len(frame) < HAT_H + 4:
-        frame.append("")
-    frame.append(f"    {DIM}{filename}{RESET}")
-    prev_count = clear_and_draw(frame, prev_count)
-    time.sleep(0.12)
-
-# === Thinking phase ===
-time.sleep(0.2)
-frame_lines = render_thinking("Hmm, interesting...", 0, filename)
-prev_count = clear_and_draw(frame_lines, prev_count)
-
-# Make streaming request
-headers = {"Content-Type": "application/json"}
-if api_key:
-    headers["Authorization"] = f"Bearer {api_key}"
-
-req = urllib.request.Request(
-    f"{url}/v1/chat/completions",
-    data=payload,
-    headers=headers
-)
-
-thinking_buf = ""
-answer_buf = ""
-in_think = False
-think_done = False
-frame_idx = 0
-last_render = 0
-
-try:
     with urllib.request.urlopen(req, timeout=300) as resp:
         buf = ""
         while True:
             chunk = resp.read(1)
-            if not chunk:
-                break
+            if not chunk: break
             buf += chunk.decode("utf-8", errors="replace")
-
             while "\n" in buf:
                 line, buf = buf.split("\n", 1)
                 line = line.strip()
-
-                if not line.startswith("data: "):
-                    continue
+                if not line.startswith("data: "): continue
                 data_str = line[6:]
-                if data_str == "[DONE]":
-                    break
-
-                try:
-                    evt = json.loads(data_str)
-                except json.JSONDecodeError:
-                    continue
-
+                if data_str == "[DONE]": break
+                try: evt = json.loads(data_str)
+                except json.JSONDecodeError: continue
                 delta = evt.get("choices", [{}])[0].get("delta", {})
-                token = delta.get("content", "")
-                reasoning = delta.get("reasoning_content", "")
-
+                token, reasoning = delta.get("content", ""), delta.get("reasoning_content", "")
                 if reasoning:
                     thinking_buf += reasoning
                 elif token:
@@ -359,105 +496,222 @@ try:
                     if "<think>" in combined and "</think>" not in combined:
                         in_think = True
                         thinking_buf += combined.split("<think>", 1)[1]
-                        answer_buf = ""
-                        continue
+                        answer_buf = ""; continue
                     elif in_think:
                         if "</think>" in combined:
-                            before_end = combined.split("</think>", 1)[0]
-                            thinking_buf += before_end
+                            thinking_buf += combined.split("</think>", 1)[0]
                             answer_buf = combined.split("</think>", 1)[1]
                             in_think = False
-                            think_done = True
                         else:
-                            thinking_buf += token
-                            answer_buf = ""
+                            thinking_buf += token; answer_buf = ""
                         continue
-
-                # Render at ~10fps
                 now = time.time()
                 if now - last_render > 0.1:
                     display = thinking_buf[-BUBBLE_W * 3:] if thinking_buf else "Hmm..."
                     display = display.replace("\n\n", "\n").strip()
                     frame_idx += 1
-                    frame_lines = render_thinking(display, frame_idx, filename)
-                    prev_count = clear_and_draw(frame_lines, prev_count)
+                    prev_count = clear_and_draw(render_thinking(display, frame_idx, filename), prev_count)
                     last_render = now
+    # If stream ended while still inside <think> tags, the answer never arrived
+    if in_think:
+        answer_buf = ""
+    return thinking_buf, answer_buf
 
-except Exception as e:
-    write_tty(f"\033[?25h")  # show cursor
-    write_tty(f"\n  error: {e}\n")
-    if tty is not None:
-        os.close(tty)
+# === Setup ===
+HAT_H = len(HAT_BODY) + 2 + 1
+drop_frames = []
+full = hat_think(0)
+for offset in range(4, 0, -1):
+    frame = ["                    "] * offset + full + ["                    "] * (4 - offset)
+    drop_frames.append(frame)
+
+headers = {"Content-Type": "application/json"}
+if api_key: headers["Authorization"] = f"Bearer {api_key}"
+
+# === Drop animation ===
+write_tty("\033[?25l")
+total_h = 17
+write_tty("\n" * total_h + f"\033[{total_h}A")
+prev_count, frame_idx = 0, 0
+
+for drop_frame in drop_frames:
+    frame = [f"  {YELLOW}{l}{RESET}" for l in drop_frame]
+    while len(frame) < HAT_H + 4: frame.append("")
+    frame.append(f"    {DIM}{filename}{RESET}")
+    prev_count = clear_and_draw(frame, prev_count)
+    time.sleep(0.12)
+
+time.sleep(0.2)
+prev_count = clear_and_draw(render_thinking("Hmm, interesting...", 0, filename), prev_count)
+
+try:
+    # === Turn 1: Guard clause (streamed, realtime) ===
+    if do_check and check_file:
+        with open(check_file) as f: check_payload = json.loads(f.read())
+        os.unlink(check_file)
+        check_messages = check_payload['messages']
+
+        thinking_buf, answer_buf = stream_request(json.dumps(check_payload).encode(), headers)
+
+        # Verdict from content only (reasoning is for thinking, not the answer)
+        # Strip complete <think> tags, and also incomplete ones (model ran out of tokens mid-think)
+        answer = re.sub(r'<think>.*?</think>', '', answer_buf, flags=re.DOTALL)
+        answer = re.sub(r'<think>.*', '', answer, flags=re.DOTALL)
+        answer = answer.strip().upper()
+        verdict = 'YES' if 'YES' in answer else 'NO'
+
+        if verdict == 'YES':
+            prev_count = clear_and_draw(
+                render_verdict("This name looks good already!", GREEN, hat_satisfied, filename), prev_count)
+            write_tty(f"\033[?25h")
+            if tty: os.close(tty)
+            print("SKIP")
+            sys.exit(0)
+        else:
+            prev_count = clear_and_draw(
+                render_verdict("This name could be better...", CYAN, lambda: hat_think(frame_idx), filename), prev_count)
+            time.sleep(1.5)
+            # Build multi-turn context: inject check messages into naming payload
+            check_messages.append({'role': 'assistant', 'content': 'NO'})
+            with open(naming_file) as f: naming_payload = json.loads(f.read())
+            # The naming prompt is the text from the naming payload's first user message
+            naming_prompt = naming_payload['messages'][0]['content']
+            if isinstance(naming_prompt, list):
+                # Image mode: extract text part
+                naming_prompt = [p for p in naming_prompt if p.get('type') == 'text'][0]['text']
+            naming_payload['messages'] = check_messages + [{'role': 'user', 'content': naming_prompt}]
+            with open(naming_file, 'w') as f: json.dump(naming_payload, f)
+
+            prev_count = clear_and_draw(
+                render_thinking("Let me think of a better name...", frame_idx, filename), prev_count)
+
+    # === Turn 2 (or only turn): Naming (streamed, realtime) ===
+    with open(naming_file) as f: naming_data = f.read().encode()
+    os.unlink(naming_file)
+
+    thinking_buf, answer_buf = stream_request(naming_data, headers)
+
+    # Output prev_count on line 1 (for reveal to clear), raw answer on line 2
+    write_tty(f"\033[?25h")
+    if tty: os.close(tty)
+    print(prev_count)
+    print(answer_buf)
+
+except urllib.error.URLError as e:
+    write_tty(f"\033[?25h\n  error: could not reach LLM at {url}: {e.reason}\n")
+    if tty: os.close(tty)
     sys.exit(1)
-
-# Extract answer
-answer = answer_buf
-answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
-
-# Sanitize filename
-lines = [l.strip().strip("`\"'") for l in answer.split("\n") if l.strip()]
-name = lines[-1] if lines else ""
-name = name.split("/")[-1]
-name = re.sub(r"[^a-zA-Z0-9._-]", "-", name)
-name = re.sub(r"-+", "-", name).strip("-")
-
-# === Result reveal ===
-if name:
-    frame_lines = render_result(name, filename)
-    prev_count = clear_and_draw(frame_lines, prev_count)
-    write_tty("\n")
-
-write_tty(f"\033[?25h")  # show cursor
-
-if tty is not None:
-    os.close(tty)
-
-# Output filename to stdout for scripting
-print(name)
+except Exception as e:
+    write_tty(f"\033[?25h\n  error: LLM request failed: {e}\n")
+    if tty: os.close(tty)
+    sys.exit(1)
 PYEOF
+); then
+    rm -f "$check_tmpjson" "$naming_tmpjson" 2>/dev/null
+    return 1
+  fi
+  rm -f "$check_tmpjson" "$naming_tmpjson" 2>/dev/null
+
+  # Handle SKIP verdict from guard clause
+  if [[ "$raw_output" == "SKIP" ]]; then
+    echo "SKIP"
+    return 0
+  fi
+
+  # Parse prev_count (line 1) and raw answer (line 2+)
+  local anim_prev_count raw_answer
+  anim_prev_count=$(echo "$raw_output" | head -1)
+  raw_answer=$(echo "$raw_output" | tail -n +2)
+
+  local name
+  name=$(sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext")
+
+  # Re-render the result with the final name (on tty), clearing previous animation
+  if [[ -n "$name" ]] && [[ -t 2 ]]; then
+    python3 - "$name" "$fname" "$anim_prev_count" <<'REVEAL'
+import sys, os
+name, fname = sys.argv[1], sys.argv[2]
+prev = int(sys.argv[3]) if len(sys.argv) > 3 and sys.argv[3].isdigit() else 0
+BOLD, GREEN, YELLOW, RESET, DIM = '\033[1m', '\033[32m', '\033[33m', '\033[0m', '\033[2m'
+BUBBLE_W = 44
+tty = os.open('/dev/tty', os.O_WRONLY) if os.path.exists('/dev/tty') else None
+def w(s):
+    if tty: os.write(tty, s.encode())
+    else: sys.stderr.write(s); sys.stderr.flush()
+# Clear previous animation frames
+if prev > 0:
+    w(f'\033[{prev}A\033[J')
+hat = [r"        /\         ", r"       /  '.       ", r"      / .-'        ",
+       r"     | ^  ^ |      ", r"     / \vv/ \      ", r"  __/````````\__   "]
+label = 'I suggest: '
+suggestion = label + name
+pad = BUBBLE_W - len(suggestion)
+w('  \u250c' + '\u2500'*(BUBBLE_W+2) + '\u2510\n')
+w('  \u2502 ' + f'{DIM}{label}{RESET}{BOLD}{GREEN}{name}{RESET}' + ' '*max(0,pad) + ' \u2502\n')
+w('  \u2514\u2500\u2500\u2500' + '\u2500'*(BUBBLE_W-1) + '\u2518\n')
+w('     \\\n      \\\n       |\n')
+for l in hat: w(f'  {YELLOW}{l}{RESET}\n')
+w(f'    {DIM}{fname}{RESET}\n\n')
+if tty: os.close(tty)
+REVEAL
+  fi
+
+  echo "$name"
 }
 
 # Non-animated fallback
 suggest_quiet() {
-  local file="$1"
-  local mode="$2"
-  local preserve_ext="$3"
+  local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
+  local orig_ext=""
+  if [[ "$preserve_ext" == "true" && "$file" == *.* ]]; then
+    orig_ext="${file##*.}"
+  fi
 
   local payload
-  payload=$(build_payload "$file" "$mode" "$preserve_ext")
+  payload=$(build_payload "$file" "$mode" "$preserve_ext" "$metadata")
 
-  echo "$payload" | python3 -c "
-import json, sys, re, urllib.request, os
+  local payload_file
+  payload_file=$(mktemp)
+  printf '%s\n' "$payload" > "$payload_file"
 
-payload = sys.stdin.read().encode()
-# Switch off streaming for quiet mode
-p = json.loads(payload)
+  local raw_answer
+  if ! raw_answer=$(python3 - "$payload_file" "${LLM_BASE_URL}" "${HAT_API_KEY:-}" <<'QUIETEOF'
+import json, sys, urllib.request, os
+
+with open(sys.argv[1]) as f: p = json.load(f)
+os.unlink(sys.argv[1])
+base_url = sys.argv[2]
+api_key = sys.argv[3] if len(sys.argv) > 3 else ""
+
 p['stream'] = False
 payload = json.dumps(p).encode()
 
 headers = {'Content-Type': 'application/json'}
-api_key = os.environ.get('HAT_API_KEY', '')
 if api_key:
     headers['Authorization'] = f'Bearer {api_key}'
 
 req = urllib.request.Request(
-    '${LLM_BASE_URL}/v1/chat/completions',
+    f'{base_url}/v1/chat/completions',
     data=payload,
     headers=headers)
-with urllib.request.urlopen(req, timeout=300) as resp:
-    data = json.loads(resp.read())
+try:
+    with urllib.request.urlopen(req, timeout=300) as resp:
+        data = json.loads(resp.read())
+except urllib.error.URLError as e:
+    print(f'error: could not reach LLM at {base_url}: {e.reason}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'error: LLM request failed: {e}', file=sys.stderr)
+    sys.exit(1)
 
 content = data['choices'][0]['message']['content']
-content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+print(content)
+QUIETEOF
+); then
+    return 1
+  fi
 
-lines = [l.strip().strip('\`\"') for l in content.split('\n') if l.strip()]
-name = lines[-1] if lines else ''
-name = name.split('/')[-1]
-import re as _re
-name = _re.sub(r'[^a-zA-Z0-9._-]', '-', name)
-name = _re.sub(r'-+', '-', name).strip('-')
-print(name)
-" 2>&1
+  sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext"
 }
 
 process_file() {
@@ -483,17 +737,48 @@ process_file() {
   fi
 
   if [[ "$mode" == "text" ]] && is_binary "$file"; then
-    echo "  $basename: binary file, cannot analyze as text" >&2
-    return 1
+    echo "  $basename: binary file, skipping (no analyzable content)" >&2
+    return 0
+  fi
+
+  # Collect metadata
+  local metadata=""
+  if [[ "$INCLUDE_METADATA" == "true" ]]; then
+    metadata=$(collect_metadata "$file" "$mode" 2>/dev/null) || metadata=""
   fi
 
   local suggested
+  local do_check="false"
+  [[ "$FORCE" != "true" ]] && do_check="true"
+
   if [[ "$quiet" == "true" ]] || ! [[ -t 2 ]]; then
-    echo -n "  $basename → " >&2
-    suggested=$(suggest_quiet "$file" "$mode" "$preserve_ext")
-    echo "$suggested" >&2
+    # Quiet mode: use non-streaming check + naming
+    CHECK_MESSAGES=""
+    if [[ "$do_check" == "true" ]]; then
+      local check_rc=0
+      check_filename "$file" "$mode" "$basename" "$metadata" || check_rc=$?
+      if [[ $check_rc -eq 1 ]]; then
+        echo "  $basename: hat says name is already good, skipping (use --force to override)" >&2
+        return 0
+      elif [[ $check_rc -eq 2 ]]; then
+        echo "  $basename: LLM check failed" >&2
+        return 1
+      fi
+      echo "  $basename: hat says this name could be better, suggesting..." >&2
+    fi
+    if ! suggested=$(suggest_quiet "$file" "$mode" "$preserve_ext" "$metadata"); then
+      echo "  $basename: LLM request failed" >&2
+      return 1
+    fi
+    echo "  $basename → $suggested" >&2
   else
-    suggested=$(stream_with_hat "$file" "$mode" "$preserve_ext")
+    # Animated mode: stream_with_hat handles both check and naming in one animation
+    if ! suggested=$(stream_with_hat "$file" "$mode" "$preserve_ext" "$metadata" "$do_check"); then
+      return 1
+    fi
+    if [[ "$suggested" == "SKIP" ]]; then
+      return 0
+    fi
   fi
 
   if [[ -z "$suggested" ]]; then
@@ -536,19 +821,19 @@ process_file() {
     return 0
   fi
 
-  # Output for scripting (stdout) — after dedup so scripts get the real name
-  echo "$suggested"
-
-  if [[ "$do_rename" != "false" ]]; then
-    if [[ "$do_rename" == "auto" ]]; then
+  if [[ "$do_rename" == "false" ]]; then
+    # Dry-run / scripting: output to stdout immediately
+    echo "$suggested"
+  elif [[ "$do_rename" == "auto" ]]; then
+    mv "$file" "$target"
+    echo "  Renamed → $target" >&2
+    echo "$suggested"
+  else
+    read -r -p "  Rename $basename to $suggested? [y/N] " confirm </dev/tty
+    if [[ "$confirm" =~ ^[Yy] ]]; then
       mv "$file" "$target"
       echo "  Renamed → $target" >&2
-    else
-      read -r -p "  Rename $suggested? [y/N] " confirm </dev/tty
-      if [[ "$confirm" =~ ^[Yy] ]]; then
-        mv "$file" "$target"
-        echo "  Renamed → $target" >&2
-      fi
+      echo "$suggested"
     fi
   fi
 }
@@ -560,6 +845,9 @@ BATCH=false
 FORCE_IMAGE=false
 PRESERVE_EXT=true
 QUIET=false
+CONTEXT=""
+INCLUDE_METADATA=true
+FORCE=false
 FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -573,7 +861,11 @@ while [[ $# -gt 0 ]]; do
     --no-ext) PRESERVE_EXT=false; shift ;;
     --quiet|-q) QUIET=true; shift ;;
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
-    --nothink) REASONING_BUDGET=0; shift ;;
+    --nothink) REASONING_BUDGET=0; GUARD_BUDGET=0; shift ;;
+    --fullthink) GUARD_BUDGET="match"; shift ;;
+    --context|-c) CONTEXT="$2"; shift 2 ;;
+    --no-metadata) INCLUDE_METADATA=false; shift ;;
+    --force|-f) FORCE=true; shift ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac
@@ -587,12 +879,17 @@ if [[ "$DRY_RUN" == "true" ]]; then
   DO_RENAME=false
 fi
 
+# Resolve --fullthink: guard budget matches naming budget
+if [[ "$GUARD_BUDGET" == "match" ]]; then
+  GUARD_BUDGET="$REASONING_BUDGET"
+fi
+
 for target in "${FILES[@]}"; do
   if [[ "$BATCH" == "true" && -d "$target" ]]; then
     echo "Sorting files in $target:" >&2
     for f in "$target"/*; do
       [[ -f "$f" ]] || continue
-      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET"
+      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" || true
     done
   else
     process_file "$target" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET"

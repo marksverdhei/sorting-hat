@@ -1,0 +1,10 @@
+{
+  "project": "sorting-hat",
+  "version": "1.2.0",
+  "description": "AI-powered file naming tool",
+  "dependencies": {
+    "python": ">=3.6",
+    "bash": ">=4.0"
+  },
+  "features": ["animation", "vision", "batch-processing"]
+}

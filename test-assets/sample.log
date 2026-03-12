@@ -1,0 +1,6 @@
+2025-03-12 08:00:01 INFO  server started on port 8080
+2025-03-12 08:00:15 INFO  GET /health 200 2ms
+2025-03-12 08:01:22 WARN  high memory usage: 85%
+2025-03-12 08:02:03 ERROR connection timeout to database host db-primary:5432
+2025-03-12 08:02:05 INFO  retrying database connection (attempt 2/3)
+2025-03-12 08:02:06 INFO  database connection restored
