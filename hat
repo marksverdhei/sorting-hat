@@ -31,6 +31,7 @@ Options:
   --quiet, -q     Suppress animation (for scripting)
   --ext, -e       Preserve original extension (default: true)
   --no-ext        Let the model choose the extension too
+  --outdir, -o    Copy renamed file to this directory instead of renaming in place
   --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
   --nothink       Disable thinking entirely (equivalent to --budget 0)
 
@@ -45,6 +46,7 @@ Examples:
   hat -y IMG_20240301_143022.jpg
   hat --batch ~/Downloads/
   hat --image screenshot.png
+  hat -o ~/sorted/ --batch ~/Downloads/
 
   # With Ollama
   LLM_BASE_URL=http://localhost:11434 HAT_MODEL=llava hat photo.jpg
@@ -466,6 +468,7 @@ process_file() {
   local preserve_ext="$3"
   local force_image="$4"
   local quiet="$5"
+  local outdir="$6"
 
   if [[ ! -f "$file" ]]; then
     echo "Not a file: $file" >&2
@@ -505,23 +508,47 @@ process_file() {
   echo "$suggested"
 
   if [[ "$do_rename" != "false" ]]; then
-    local target="$dir/$suggested"
-    if [[ "$target" == "$file" ]]; then
+    local target_dir="$dir"
+    if [[ -n "$outdir" ]]; then
+      target_dir="$outdir"
+    fi
+    local target="$target_dir/$suggested"
+    if [[ -z "$outdir" && "$target" == "$file" ]]; then
       echo "  (already named correctly)" >&2
       return 0
     fi
     if [[ -e "$target" ]]; then
-      echo "  Target already exists: $target" >&2
-      return 1
+      # Find a unique name by appending -1, -2, etc.
+      local base ext_part counter new_suggested
+      if [[ "$suggested" == *.* ]]; then
+        base="${suggested%.*}"
+        ext_part=".${suggested##*.}"
+      else
+        base="$suggested"
+        ext_part=""
+      fi
+      counter=1
+      while [[ -e "$target_dir/${base}-${counter}${ext_part}" ]]; do
+        ((counter++))
+      done
+      new_suggested="${base}-${counter}${ext_part}"
+      target="$target_dir/$new_suggested"
+      echo "  Target existed, using: $new_suggested" >&2
+    fi
+    local verb="Renamed" op="mv"
+    if [[ -n "$outdir" ]]; then
+      verb="Copied" op="cp"
     fi
     if [[ "$do_rename" == "auto" ]]; then
-      mv "$file" "$target"
-      echo "  Renamed → $target" >&2
+      $op "$file" "$target"
+      echo "  $verb → $target" >&2
     else
-      read -r -p "  Rename? [y/N] " confirm </dev/tty
+      local prompt_msg="Rename?"
+      [[ -n "$outdir" ]] && prompt_msg="Copy?"
+      read -r -p "  $prompt_msg [y/N] " confirm </dev/tty
       if [[ "$confirm" =~ ^[Yy] ]]; then
-        mv "$file" "$target"
-        echo "  Renamed → $target" >&2
+        $op "$file" "$target"
+        echo "  $verb → $target" >&2
       fi
     fi
   fi
@@ -534,6 +561,7 @@ BATCH=false
 FORCE_IMAGE=false
 PRESERVE_EXT=true
 QUIET=false
+OUTDIR=""
 FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -546,6 +574,7 @@ while [[ $# -gt 0 ]]; do
     --ext|-e) PRESERVE_EXT=true; shift ;;
     --no-ext) PRESERVE_EXT=false; shift ;;
     --quiet|-q) QUIET=true; shift ;;
+    --outdir|-o) OUTDIR="$2"; shift 2 ;;
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
     --nothink) REASONING_BUDGET=0; shift ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
@@ -561,14 +590,18 @@ if [[ "$DRY_RUN" == "true" ]]; then
   DO_RENAME=false
 fi
 
+if [[ -n "$OUTDIR" ]]; then
+  mkdir -p "$OUTDIR"
+fi
+
 for target in "${FILES[@]}"; do
   if [[ "$BATCH" == "true" && -d "$target" ]]; then
     echo "Sorting files in $target:" >&2
     for f in "$target"/*; do
       [[ -f "$f" ]] || continue
-      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET"
+      process_file "$f" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
     done
   else
-    process_file "$target" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET"
+    process_file "$target" "$DO_RENAME" "$PRESERVE_EXT" "$FORCE_IMAGE" "$QUIET" "$OUTDIR"
   fi
 done
