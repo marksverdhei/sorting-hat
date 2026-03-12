@@ -74,7 +74,7 @@ Set these environment variables (or export them in your shell profile):
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `LLM_BASE_URL` | `http://localhost:8080` | Base URL of your OpenAI-compatible API |
-| `HAT_MODEL` | `gpt-4o` | Model name to use |
+| `HAT_MODEL` | `Qwen3.5-9b` | Model name to use |
 | `HAT_API_KEY` | *(empty)* | API key (optional, for cloud providers) |
 | `HAT_REASONING_BUDGET` | `1024` | Reasoning token budget for naming (`-1` for unlimited) |
 
@@ -101,7 +101,7 @@ export HAT_MODEL=Qwen/Qwen3.5-9b
 **OpenAI**:
 ```bash
 export LLM_BASE_URL=https://api.openai.com
-export HAT_MODEL=gpt-4o
+export HAT_MODEL=Qwen3.5-9b
 export HAT_API_KEY=sk-...
 ```
 

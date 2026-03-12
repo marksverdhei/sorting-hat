@@ -4,7 +4,7 @@
 set -euo pipefail
 
 LLM_BASE_URL="${LLM_BASE_URL:-http://localhost:8080}"
-HAT_MODEL="${HAT_MODEL:-gpt-4o}"
+HAT_MODEL="${HAT_MODEL:-Qwen3.5-9b}"
 REASONING_BUDGET="${HAT_REASONING_BUDGET:-1024}"
 GUARD_BUDGET=0  # guard clause defaults to no thinking
 
@@ -41,7 +41,7 @@ Options:
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
-  HAT_MODEL                Model name to use (default: gpt-4o)
+  HAT_MODEL                Model name to use (default: Qwen3.5-9b)
   HAT_API_KEY              API key for the LLM (optional, for cloud providers)
   HAT_REASONING_BUDGET     Reasoning token budget (default: 1024)
 
