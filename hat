@@ -161,15 +161,11 @@ except Exception as e:
     print(f'error: LLM request failed: {e}', file=sys.stderr)
     sys.exit(1)
 
-msg = data['choices'][0]['message']
-answer = msg.get('content', '') or ''
-reasoning = msg.get('reasoning_content', '') or ''
-# Some models (Qwen) put the answer in reasoning_content and leave content empty
-combined = answer + ' ' + reasoning
-combined = re.sub(r'<think>.*?</think>', '', combined, flags=re.DOTALL).strip().upper()
+answer = data['choices'][0]['message']['content']
+answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip().upper()
 
 # Output: verdict on line 1, then the messages JSON for multi-turn context on line 2
-verdict = 'YES' if 'YES' in combined else 'NO'
+verdict = 'YES' if 'YES' in answer else 'NO'
 # Build conversation history for turn 2
 messages.append({'role': 'assistant', 'content': verdict})
 print(verdict)
@@ -551,9 +547,9 @@ try:
 
         thinking_buf, answer_buf = stream_request(json.dumps(check_payload).encode(), headers)
 
-        # Verdict from both content and reasoning (Qwen compat)
-        combined = re.sub(r'<think>.*?</think>', '', (answer_buf + ' ' + thinking_buf), flags=re.DOTALL).strip().upper()
-        verdict = 'YES' if 'YES' in combined else 'NO'
+        # Verdict from content only (reasoning is for thinking, not the answer)
+        answer = re.sub(r'<think>.*?</think>', '', answer_buf, flags=re.DOTALL).strip().upper()
+        verdict = 'YES' if 'YES' in answer else 'NO'
 
         if verdict == 'YES':
             prev_count = clear_and_draw(
