@@ -10,34 +10,56 @@ setup_file() {
   export TEST_ASSETS="$BATS_TEST_DIRNAME/test-assets"
 
   # Source testable bash functions
-  eval "$(sed -n '/^filename_needs_renaming/,/^}/p' "$HAT")"
   eval "$(sed -n '/^sanitize_name/,/^}/p' "$HAT")"
   eval "$(sed -n '/^is_binary/,/^}/p' "$HAT")"
   eval "$(sed -n '/^collect_metadata/,/^}/p' "$HAT")"
-  export -f filename_needs_renaming sanitize_name is_binary collect_metadata
+  export -f sanitize_name is_binary collect_metadata
 
-  # Start mock LLM server
+  # Start mock LLM server that handles multi-turn conversations
   export MOCK_PORT=18950
   export MOCK_DIR=$(mktemp -d)
-  python3 -c "
+  python3 - "$MOCK_PORT" "$MOCK_DIR" <<'MOCKSERVER' &
+import sys
 from http.server import HTTPServer, BaseHTTPRequestHandler
 import json, os
+
+MOCK_DIR = sys.argv[2]
+
 class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers['Content-Length'])
         body = json.loads(self.rfile.read(length))
-        msg = body['messages'][0]
-        content = msg['content'] if isinstance(msg['content'], str) else msg['content'][-1]['text']
-        with open('${MOCK_DIR}/last_prompt.txt', 'w') as f:
+        msgs = body['messages']
+        last_msg = msgs[-1]
+        content = last_msg['content'] if isinstance(last_msg['content'], str) else last_msg['content'][-1]['text']
+
+        # Save last prompt for inspection
+        with open(os.path.join(MOCK_DIR, 'last_prompt.txt'), 'w') as f:
             f.write(content)
-        resp = json.dumps({'choices': [{'message': {'content': 'suggested-name'}}]})
+        with open(os.path.join(MOCK_DIR, 'last_request.json'), 'w') as f:
+            json.dump(body, f, indent=2)
+
+        # Determine response based on request type
+        if 'already' in content and ('YES' in content or 'NO' in content):
+            # Check call: read override file if present, otherwise default NO
+            override = os.path.join(MOCK_DIR, 'check_response')
+            if os.path.exists(override):
+                answer = open(override).read().strip()
+            else:
+                answer = 'NO'
+        else:
+            # Naming call
+            answer = 'suggested-name'
+
+        resp = json.dumps({'choices': [{'message': {'content': answer}}]})
         self.send_response(200)
         self.send_header('Content-Type', 'application/json')
         self.end_headers()
         self.wfile.write(resp.encode())
     def log_message(self, *a): pass
-HTTPServer(('127.0.0.1', ${MOCK_PORT}), Handler).serve_forever()
-" &
+
+HTTPServer(('127.0.0.1', int(sys.argv[1])), Handler).serve_forever()
+MOCKSERVER
   export MOCK_PID=$!
   sleep 0.5
 }
@@ -45,58 +67,6 @@ HTTPServer(('127.0.0.1', ${MOCK_PORT}), Handler).serve_forever()
 teardown_file() {
   kill "$MOCK_PID" 2>/dev/null || true
   rm -rf "$MOCK_DIR"
-}
-
-# ── Guard clause ─────────────────────────────────────────────────────
-
-@test "guard: IMG_1234.jpg needs renaming" {
-  run filename_needs_renaming "IMG_1234.jpg"
-  assert_success
-}
-
-@test "guard: DSC_0001.png needs renaming" {
-  run filename_needs_renaming "DSC_0001.png"
-  assert_success
-}
-
-@test "guard: PXL_20240301.jpg needs renaming" {
-  run filename_needs_renaming "PXL_20240301.jpg"
-  assert_success
-}
-
-@test "guard: Screenshot_2024-01-01.png needs renaming" {
-  run filename_needs_renaming "Screenshot_2024-01-01.png"
-  assert_success
-}
-
-@test "guard: 20240301_143022.jpg needs renaming" {
-  run filename_needs_renaming "20240301_143022.jpg"
-  assert_success
-}
-
-@test "guard: hex string needs renaming" {
-  run filename_needs_renaming "abcdef1234abcd.txt"
-  assert_success
-}
-
-@test "guard: WhatsApp file needs renaming" {
-  run filename_needs_renaming "IMG-20240301-WA0001.jpg"
-  assert_success
-}
-
-@test "guard: descriptive name is kept" {
-  run filename_needs_renaming "quarterly-finance-report.pdf"
-  assert_failure
-}
-
-@test "guard: hello-world.py is kept" {
-  run filename_needs_renaming "hello-world.py"
-  assert_failure
-}
-
-@test "guard: project-proposal.txt is kept" {
-  run filename_needs_renaming "project-proposal.txt"
-  assert_failure
 }
 
 # ── Sanitize name ───────────────────────────────────────────────────
@@ -183,7 +153,7 @@ teardown_file() {
   assert_output --partial "--batch"
 }
 
-# ── Integration: mock LLM ───────────────────────────────────────────
+# ── Integration: naming with --force (single turn) ──────────────────
 
 @test "integration: basic naming returns sanitized result" {
   run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.txt' 2>/dev/null"
@@ -219,15 +189,34 @@ teardown_file() {
   assert_output --partial "skipping"
 }
 
-@test "integration: batch guard skips good names" {
-  run bash "$HAT" --quiet --dry-run --batch "$TEST_ASSETS/"
+# ── Integration: LLM-based guard clause (two-turn) ──────────────────
+
+@test "guard: LLM check says NO → proceeds to rename" {
+  echo "NO" > "$MOCK_DIR/check_response"
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run '$TEST_ASSETS/sample.txt' 2>/dev/null"
+  assert_output "suggested-name.txt"
+}
+
+@test "guard: LLM check says YES → skips file" {
+  echo "YES" > "$MOCK_DIR/check_response"
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run '$TEST_ASSETS/sample.txt' 2>&1"
   assert_output --partial "looks good, skipping"
 }
 
-@test "integration: --force overrides guard" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force --batch '$TEST_ASSETS/' 2>&1"
-  refute_output --partial "looks good, skipping"
+@test "guard: --force skips LLM check entirely" {
+  echo "YES" > "$MOCK_DIR/check_response"
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.txt' 2>/dev/null"
+  assert_output "suggested-name.txt"
 }
+
+@test "guard: two-turn naming has 3 messages (check context)" {
+  echo "NO" > "$MOCK_DIR/check_response"
+  bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run '$TEST_ASSETS/sample.txt'" >/dev/null 2>&1
+  run python3 -c "import json; d=json.load(open('$MOCK_DIR/last_request.json')); print(len(d['messages']))"
+  assert_output "3"
+}
+
+# ── Integration: error handling ──────────────────────────────────────
 
 @test "integration: connection error shows clear message" {
   run bash -c "LLM_BASE_URL=http://127.0.0.1:19999 bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.txt' 2>&1"

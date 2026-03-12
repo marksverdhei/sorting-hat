@@ -35,7 +35,7 @@ Options:
   --nothink         Disable thinking entirely (equivalent to --budget 0)
   --context, -c     Additional context to guide naming (e.g. "Q3 marketing")
   --no-metadata     Don't include file metadata in LLM context
-  --force, -f       Process all files even if names already look descriptive
+  --force, -f       Skip name quality check, always suggest a new name
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
@@ -94,31 +94,96 @@ is_image() {
   [[ "$ext" =~ ^(svg)$ ]]
 }
 
-# Check if a filename looks auto-generated and needs renaming
-filename_needs_renaming() {
-  local stem="${1%.*}"
-  [[ "$stem" == "$1" ]] && stem="$1"
+# Ask the LLM if a filename already describes the file content well.
+# Returns 0 if the name needs renaming (LLM says NO), 1 if it's already good (YES).
+# Also outputs the check conversation JSON (messages array) for use as context in turn 2.
+check_filename() {
+  local file="$1" mode="$2" basename="$3" metadata="${4:-}"
 
-  # Camera defaults
-  [[ "$stem" =~ ^IMG[-_][0-9]+$ ]] && return 0
-  [[ "$stem" =~ ^DSC[-_]?[0-9]+$ ]] && return 0
-  [[ "$stem" =~ ^DSCN?[0-9]+$ ]] && return 0
-  [[ "$stem" =~ ^P[0-9]{7,}$ ]] && return 0
-  [[ "$stem" =~ ^PXL_[0-9]+$ ]] && return 0
-  # Screenshots
-  [[ "$stem" =~ ^[Ss]creenshot[-_\ ][0-9] ]] && return 0
-  [[ "$stem" =~ ^Screen[-_\ ][Ss]hot ]] && return 0
-  # Date-stamped (YYYYMMDD_HHMMSS)
-  [[ "$stem" =~ ^[0-9]{8}[-_][0-9]{4,6}$ ]] && return 0
-  # Random hex / UUIDs
-  [[ "$stem" =~ ^[0-9a-fA-F]{8,}$ ]] && return 0
-  [[ "$stem" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 0
-  # WhatsApp-style
-  [[ "$stem" =~ ^(IMG|VID|AUD)-[0-9]{8}-WA[0-9]+ ]] && return 0
-  # Pure numeric with separators
-  [[ "$stem" =~ ^[0-9_-]+$ ]] && return 0
+  local check_prompt="Given this file and its current filename \"$basename\", is the filename already a good, descriptive name for the content? Reply ONLY 'YES' or 'NO'."
 
-  return 1  # name looks fine
+  if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
+    check_prompt="$check_prompt
+
+File metadata: $metadata"
+  fi
+
+  local result
+  if ! result=$(python3 - "$file" "$mode" "$check_prompt" "$HAT_MODEL" "$REASONING_BUDGET" "${LLM_BASE_URL}" "${HAT_API_KEY:-}" <<'CHECKEOF'
+import json, sys, base64, io, urllib.request, re, os
+
+file, mode, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+budget = int(sys.argv[5])
+base_url, api_key = sys.argv[6], sys.argv[7] if len(sys.argv) > 7 else ""
+
+# Build user message content
+if mode == "image":
+    ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
+    if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
+        from PIL import Image
+        img = Image.open(file).convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        mime = 'image/png'
+    else:
+        with open(file, 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode()
+        mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
+                'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
+    user_content = [
+        {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
+        {'type': 'text', 'text': prompt}
+    ]
+else:
+    with open(file, 'r', errors='replace') as f:
+        content = f.read(4000)
+    user_content = prompt + '\n\nFile contents:\n' + content
+
+messages = [{'role': 'user', 'content': user_content}]
+payload = {'model': model, 'stream': False, 'temperature': 0.1, 'max_tokens': 10, 'messages': messages}
+if budget >= 0:
+    payload['thinking_budget_tokens'] = 0  # no reasoning needed for yes/no
+
+headers = {'Content-Type': 'application/json'}
+if api_key:
+    headers['Authorization'] = f'Bearer {api_key}'
+
+req = urllib.request.Request(f'{base_url}/v1/chat/completions',
+    data=json.dumps(payload).encode(), headers=headers)
+try:
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        data = json.loads(resp.read())
+except urllib.error.URLError as e:
+    print(f'error: could not reach LLM at {base_url}: {e.reason}', file=sys.stderr)
+    sys.exit(1)
+except Exception as e:
+    print(f'error: LLM request failed: {e}', file=sys.stderr)
+    sys.exit(1)
+
+answer = data['choices'][0]['message']['content']
+answer = re.sub(r'<think>.*?</think>', '', answer, flags=re.DOTALL).strip().upper()
+
+# Output: verdict on line 1, then the messages JSON for multi-turn context on line 2
+verdict = 'YES' if 'YES' in answer else 'NO'
+# Build conversation history for turn 2
+messages.append({'role': 'assistant', 'content': verdict})
+print(verdict)
+print(json.dumps(messages))
+CHECKEOF
+  ); then
+    return 2  # error
+  fi
+
+  local verdict
+  verdict=$(echo "$result" | head -1)
+  # Export the conversation context for turn 2
+  CHECK_MESSAGES=$(echo "$result" | tail -1)
+
+  if [[ "$verdict" == "YES" ]]; then
+    return 1  # name is already good
+  fi
+  return 0  # needs renaming
 }
 
 # Collect file metadata as JSON
@@ -153,9 +218,11 @@ print(json.dumps(meta, ensure_ascii=False))
 }
 
 # Build the JSON payload for the API call, output to stdout
+# If CHECK_MESSAGES is set, uses it as conversation history (multi-turn from check_filename)
 build_payload() {
   local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
   local ext="${file##*.}"
+  local prior_messages="${CHECK_MESSAGES:-}"
 
   local ext_instruction
   if [[ "$preserve_ext" == "true" && -n "$ext" && "$ext" != "$file" ]]; then
@@ -164,7 +231,7 @@ build_payload() {
     ext_instruction="Choose an appropriate extension."
   fi
 
-  local prompt="You are a file naming assistant. Suggest a single appropriate filename. Rules:
+  local prompt="Suggest a single appropriate filename. Rules:
 - Use lowercase with hyphens (kebab-case), no spaces
 - Be descriptive but concise (2-5 words)
 - $ext_instruction
@@ -181,56 +248,49 @@ build_payload() {
 File metadata: $metadata"
   fi
 
-  if [[ "$mode" == "image" ]]; then
-    python3 -c "
+  python3 - "$file" "$mode" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" "$prior_messages" <<'BUILDEOF'
 import json, base64, sys, io
-file, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3]
-budget = int(sys.argv[4])
-ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
-if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
-    from PIL import Image
-    img = Image.open(file).convert('RGB')
-    buf = io.BytesIO()
-    img.save(buf, format='PNG')
-    b64 = base64.b64encode(buf.getvalue()).decode()
-    mime = 'image/png'
-else:
-    with open(file, 'rb') as f:
-        b64 = base64.b64encode(f.read()).decode()
-    mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
-            'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
-payload = {
-    'model': model, 'stream': True, 'temperature': 0.3,
-    'messages': [{'role': 'user', 'content': [
+
+file, mode, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+budget = int(sys.argv[5])
+prior_json = sys.argv[6] if len(sys.argv) > 6 and sys.argv[6] else ""
+
+# Start with prior conversation if available (multi-turn from check_filename)
+if prior_json:
+    messages = json.loads(prior_json)
+    # Turn 2: just the naming instruction (content already in turn 1)
+    messages.append({'role': 'user', 'content': prompt})
+elif mode == "image":
+    ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
+    if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
+        from PIL import Image
+        img = Image.open(file).convert('RGB')
+        buf = io.BytesIO()
+        img.save(buf, format='PNG')
+        b64 = base64.b64encode(buf.getvalue()).decode()
+        mime = 'image/png'
+    else:
+        with open(file, 'rb') as f:
+            b64 = base64.b64encode(f.read()).decode()
+        mime = {'jpg':'image/jpeg','jpeg':'image/jpeg','png':'image/png',
+                'svg':'image/svg+xml'}.get(ext, 'image/jpeg')
+    messages = [{'role': 'user', 'content': [
         {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
         {'type': 'text', 'text': prompt}
     ]}]
-}
+else:
+    with open(file, 'r', errors='replace') as f:
+        content = f.read(4000)
+    if not content.strip():
+        print('{}')
+        sys.exit(0)
+    messages = [{'role': 'user', 'content': prompt + '\n\nFile contents:\n' + content}]
+
+payload = {'model': model, 'stream': True, 'temperature': 0.3, 'messages': messages}
 if budget >= 0:
     payload['thinking_budget_tokens'] = budget
 print(json.dumps(payload))
-" "$file" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET"
-  else
-    local content
-    content=$(head -c 4000 "$file" 2>/dev/null)
-    if [[ -z "$content" ]]; then
-      echo '{}' # will be caught as error
-      return
-    fi
-    python3 -c "
-import json, sys
-prompt, model = sys.argv[1], sys.argv[2]
-budget = int(sys.argv[3])
-content = sys.stdin.read()
-payload = {
-    'model': model, 'stream': True, 'temperature': 0.3,
-    'messages': [{'role': 'user', 'content': prompt + '\n\nFile contents:\n' + content}]
-}
-if budget >= 0:
-    payload['thinking_budget_tokens'] = budget
-print(json.dumps(payload))
-" "$prompt" "$HAT_MODEL" "$REASONING_BUDGET" <<< "$content"
-  fi
+BUILDEOF
 }
 
 # Sanitize raw LLM answer into a valid filename stem
@@ -604,12 +664,6 @@ process_file() {
   local dir
   dir=$(dirname "$file")
 
-  # Guard clause: skip files with descriptive names unless --force
-  if [[ "$FORCE" != "true" ]] && ! filename_needs_renaming "$basename"; then
-    echo "  $basename: name looks good, skipping (use --force to override)" >&2
-    return 0
-  fi
-
   local mode="text"
   if [[ "$force_image" == "true" ]] || is_image "$file"; then
     mode="image"
@@ -624,6 +678,21 @@ process_file() {
   local metadata=""
   if [[ "$INCLUDE_METADATA" == "true" ]]; then
     metadata=$(collect_metadata "$file" "$mode" 2>/dev/null) || metadata=""
+  fi
+
+  # Guard clause: ask the LLM if the filename is already descriptive
+  CHECK_MESSAGES=""
+  if [[ "$FORCE" != "true" ]]; then
+    local check_rc=0
+    check_filename "$file" "$mode" "$basename" "$metadata" || check_rc=$?
+    if [[ $check_rc -eq 1 ]]; then
+      echo "  $basename: name looks good, skipping (use --force to override)" >&2
+      return 0
+    elif [[ $check_rc -eq 2 ]]; then
+      echo "  $basename: LLM check failed" >&2
+      return 1
+    fi
+    # check_rc == 0: needs renaming, CHECK_MESSAGES is set for multi-turn context
   fi
 
   local suggested
