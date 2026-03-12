@@ -33,8 +33,9 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Supports both text files and images (via vision/multimodal models)
 - Auto-detects image files by extension
 - Handles reasoning/thinking tokens from models like Qwen, DeepSeek, etc.
-- Quiet mode for scripting (`--quiet`)
-- Batch processing for entire directories
+- Quiet mode for scripting (`--quiet` / `-q`)
+- Disable reasoning/thinking tokens (`--nothink`) for faster inference or models that don't support them
+- Batch processing for entire directories (processes files sequentially)
 - Interactive rename with confirmation
 - Preserves original file extension by default
 
@@ -129,6 +130,9 @@ hat --dry-run report.txt
 
 # Let the model choose the extension
 hat --no-ext mystery-file
+
+# Disable reasoning/thinking tokens
+hat --nothink photo.jpg
 ```
 
 ### Scripting
