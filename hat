@@ -501,24 +501,50 @@ process_file() {
     return 1
   fi
 
-  # Output for scripting (stdout)
+  # Guard: if the model thinks the current name is already appropriate
+  if [[ "$suggested" == "$basename" ]]; then
+    echo "  Hat thinks the name is already appropriate: $basename" >&2
+    echo "$suggested"
+    return 0
+  fi
+
+  # Deduplicate: if target exists (and isn't the file itself), append -1, -2, etc.
+  local target="$dir/$suggested"
+  if [[ -e "$target" && "$target" != "$file" ]]; then
+    local base ext_part counter
+    if [[ "$suggested" == *.* ]]; then
+      base="${suggested%.*}"
+      ext_part=".${suggested##*.}"
+    else
+      base="$suggested"
+      ext_part=""
+    fi
+    counter=1
+    suggested="${base}-${counter}${ext_part}"
+    while [[ -e "$dir/$suggested" && "$dir/$suggested" != "$file" ]]; do
+      ((counter++))
+      suggested="${base}-${counter}${ext_part}"
+    done
+    target="$dir/$suggested"
+    echo "  Target existed, using: $suggested" >&2
+  fi
+
+  # After dedup, the final name might match the source file
+  if [[ "$suggested" == "$basename" ]]; then
+    echo "  Hat thinks the name is already appropriate: $basename" >&2
+    echo "$suggested"
+    return 0
+  fi
+
+  # Output for scripting (stdout) — after dedup so scripts get the real name
   echo "$suggested"
 
   if [[ "$do_rename" != "false" ]]; then
-    local target="$dir/$suggested"
-    if [[ "$target" == "$file" ]]; then
-      echo "  (already named correctly)" >&2
-      return 0
-    fi
-    if [[ -e "$target" ]]; then
-      echo "  Target already exists: $target" >&2
-      return 1
-    fi
     if [[ "$do_rename" == "auto" ]]; then
       mv "$file" "$target"
       echo "  Renamed → $target" >&2
     else
-      read -r -p "  Rename? [y/N] " confirm </dev/tty
+      read -r -p "  Rename $suggested? [y/N] " confirm </dev/tty
       if [[ "$confirm" =~ ^[Yy] ]]; then
         mv "$file" "$target"
         echo "  Renamed → $target" >&2
