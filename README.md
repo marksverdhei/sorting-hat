@@ -4,9 +4,9 @@ A command-line tool that uses AI to suggest descriptive filenames based on file 
 
 ```
   ┌──────────────────────────────────────────────────┐
-  │ Hmm, this appears to be a sunset photograph     │
+  │ Hmm, this appears to be a sunset photograph      │
   │ taken over a mountain range...                   │
-  └──┐──────────────────────────────────────────────┘
+  └──┐───────────────────────────────────────────────┘
      │
      ╰─┐
        |
