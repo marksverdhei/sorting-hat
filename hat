@@ -24,15 +24,18 @@ Usage:
   hat --quiet <file>          No animation, just print the name
 
 Options:
-  --yes, -y       Auto-rename without confirmation
-  --batch, -b     Process all files in a directory
-  --image, -i     Use vision model for image files
-  --dry-run, -n   Just show suggestions, no rename
-  --quiet, -q     Suppress animation (for scripting)
-  --ext, -e       Preserve original extension (default: true)
-  --no-ext        Let the model choose the extension too
-  --budget, -rb   Reasoning token budget (default: 1024, -1 for unlimited)
-  --nothink       Disable thinking entirely (equivalent to --budget 0)
+  --yes, -y         Auto-rename without confirmation
+  --batch, -b       Process all files in a directory
+  --image, -i       Use vision model for image files
+  --dry-run, -n     Just show suggestions, no rename
+  --quiet, -q       Suppress animation (for scripting)
+  --ext, -e         Preserve original extension (default: true)
+  --no-ext          Let the model choose the extension too
+  --budget, -rb     Reasoning token budget (default: 1024, -1 for unlimited)
+  --nothink         Disable thinking entirely (equivalent to --budget 0)
+  --context, -c     Additional context to guide naming (e.g. "Q3 marketing")
+  --no-metadata     Don't include file metadata in LLM context
+  --force, -f       Process all files even if names already look descriptive
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
@@ -45,6 +48,8 @@ Examples:
   hat -y IMG_20240301_143022.jpg
   hat --batch ~/Downloads/
   hat --image screenshot.png
+  hat -c "quarterly finance report" document.pdf
+  hat --batch --force ~/unsorted/
 
   # With Ollama
   LLM_BASE_URL=http://localhost:11434 HAT_MODEL=llava hat photo.jpg
@@ -68,16 +73,74 @@ is_image() {
   [[ "$ext" =~ ^(jpg|jpeg|png|gif|webp|bmp|tiff|tif|svg)$ ]]
 }
 
+# Check if a filename looks auto-generated and needs renaming
+filename_needs_renaming() {
+  local stem="${1%.*}"
+  [[ "$stem" == "$1" ]] && stem="$1"
+
+  # Camera defaults
+  [[ "$stem" =~ ^IMG[-_][0-9]+$ ]] && return 0
+  [[ "$stem" =~ ^DSC[-_]?[0-9]+$ ]] && return 0
+  [[ "$stem" =~ ^DSCN?[0-9]+$ ]] && return 0
+  [[ "$stem" =~ ^P[0-9]{7,}$ ]] && return 0
+  [[ "$stem" =~ ^PXL_[0-9]+$ ]] && return 0
+  # Screenshots
+  [[ "$stem" =~ ^[Ss]creenshot[-_\ ][0-9] ]] && return 0
+  [[ "$stem" =~ ^Screen[-_\ ][Ss]hot ]] && return 0
+  # Date-stamped (YYYYMMDD_HHMMSS)
+  [[ "$stem" =~ ^[0-9]{8}[-_][0-9]{4,6}$ ]] && return 0
+  # Random hex / UUIDs
+  [[ "$stem" =~ ^[0-9a-fA-F]{8,}$ ]] && return 0
+  [[ "$stem" =~ ^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$ ]] && return 0
+  # WhatsApp-style
+  [[ "$stem" =~ ^(IMG|VID|AUD)-[0-9]{8}-WA[0-9]+ ]] && return 0
+  # Pure numeric with separators
+  [[ "$stem" =~ ^[0-9_-]+$ ]] && return 0
+
+  return 1  # name looks fine
+}
+
+# Collect file metadata as JSON
+collect_metadata() {
+  local file="$1" mode="$2"
+  python3 -c "
+import sys, os, datetime, json, mimetypes
+file, mode = sys.argv[1], sys.argv[2]
+meta = {}
+stat = os.stat(file)
+meta['size_bytes'] = stat.st_size
+meta['modified'] = datetime.datetime.fromtimestamp(stat.st_mtime).strftime('%Y-%m-%d %H:%M')
+mime, _ = mimetypes.guess_type(file)
+if mime:
+    meta['mime_type'] = mime
+if mode == 'image':
+    try:
+        from PIL import Image
+        from PIL.ExifTags import TAGS
+        exif = Image.open(file).getexif()
+        if exif:
+            ed = {}
+            for tid, val in exif.items():
+                tag = TAGS.get(tid, tid)
+                if isinstance(val, (str, int, float)):
+                    ed[str(tag)] = str(val)[:100]
+            if ed: meta['exif'] = ed
+    except Exception:
+        pass
+print(json.dumps(meta, ensure_ascii=False))
+" "$file" "$mode"
+}
+
 # Build the JSON payload for the API call, output to stdout
 build_payload() {
-  local file="$1"
-  local mode="$2"
-  local preserve_ext="$3"
+  local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
   local ext="${file##*.}"
 
-  local ext_instruction="Choose an appropriate extension."
+  local ext_instruction
   if [[ "$preserve_ext" == "true" && -n "$ext" && "$ext" != "$file" ]]; then
-    ext_instruction="Keep the extension as .$ext."
+    ext_instruction="Do NOT include any file extension in your response. Reply with ONLY the name stem."
+  else
+    ext_instruction="Choose an appropriate extension."
   fi
 
   local prompt="You are a file naming assistant. Suggest a single appropriate filename. Rules:
@@ -86,13 +149,23 @@ build_payload() {
 - $ext_instruction
 - Reply with ONLY the filename, nothing else"
 
+  if [[ -n "$CONTEXT" ]]; then
+    prompt="$prompt
+- Additional context: $CONTEXT"
+  fi
+
+  if [[ -n "$metadata" && "$metadata" != "{}" ]]; then
+    prompt="$prompt
+
+File metadata: $metadata"
+  fi
+
   if [[ "$mode" == "image" ]]; then
     python3 -c "
 import json, base64, sys, io
 file, prompt, model = sys.argv[1], sys.argv[2], sys.argv[3]
 budget = int(sys.argv[4])
 ext = file.rsplit('.', 1)[-1].lower() if '.' in file else ''
-# Some backends (e.g. llama.cpp) only support PNG/JPEG — convert other formats
 if ext in ('webp', 'bmp', 'tiff', 'tif', 'gif'):
     from PIL import Image
     img = Image.open(file).convert('RGB')
@@ -139,22 +212,44 @@ print(json.dumps(payload))
   fi
 }
 
+# Sanitize raw LLM answer into a valid filename stem
+# Usage: sanitize_name RAW_ANSWER PRESERVE_EXT ORIGINAL_EXT
+sanitize_name() {
+  python3 - "$1" "$2" "$3" <<'SANITIZE'
+import re, sys
+answer, preserve_ext, orig_ext = sys.argv[1], sys.argv[2], sys.argv[3]
+answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
+lines = [l.strip().strip('`"\'') for l in answer.split("\n") if l.strip()]
+name = lines[-1] if lines else ""
+name = name.split("/")[-1]
+name = re.sub(r"[^a-zA-Z0-9._-]", "-", name)
+name = re.sub(r"-+", "-", name).strip("-")
+if preserve_ext == "true" and orig_ext:
+    if "." in name:
+        name = name.rsplit(".", 1)[0]
+    name = name + "." + orig_ext
+print(name)
+SANITIZE
+}
+
 # Stream the LLM response with sorting hat animation on stderr, print filename on stdout
 stream_with_hat() {
-  local file="$1"
-  local mode="$2"
-  local preserve_ext="$3"
-  local basename
-  basename=$(basename "$file")
+  local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
+  local fname orig_ext=""
+  fname=$(basename "$file")
+  if [[ "$preserve_ext" == "true" && "$fname" == *.* ]]; then
+    orig_ext="${fname##*.}"
+  fi
 
   local payload
-  payload=$(build_payload "$file" "$mode" "$preserve_ext")
+  payload=$(build_payload "$file" "$mode" "$preserve_ext" "$metadata")
 
   local tmpjson
   tmpjson=$(mktemp)
   echo "$payload" > "$tmpjson"
 
-  python3 - "$LLM_BASE_URL" "$basename" "$tmpjson" "${HAT_API_KEY:-}" <<'PYEOF'
+  local raw_answer
+  raw_answer=$(python3 - "$LLM_BASE_URL" "$fname" "$tmpjson" "${HAT_API_KEY:-}" <<'PYEOF'
 import sys, json, re, urllib.request, textwrap, time, os
 
 url = sys.argv[1]
@@ -168,8 +263,6 @@ os.unlink(payload_file)
 
 BUBBLE_W = 44
 
-# Sorting Hat ASCII art — proper witch's hat with wide brim
-# The face is in the crumpled band above the brim
 HAT_BODY = [
     r"        /\         ",
     r"       /  '.       ",
@@ -177,14 +270,13 @@ HAT_BODY = [
 ]
 
 HAT_THINK_FACES = [
-    [r"     | o  o |      ", r"     / ~~~~ \      "],  # frame 0
-    [r"     | -  o |      ", r"     / ~~~~ \      "],  # frame 1
-    [r"     | o  - |      ", r"     / ---- \      "],  # frame 2
-    [r"     | o  o |      ", r"     / ---- \      "],  # frame 3
+    [r"     | o  o |      ", r"     / ~~~~ \      "],
+    [r"     | -  o |      ", r"     / ~~~~ \      "],
+    [r"     | o  - |      ", r"     / ---- \      "],
+    [r"     | o  o |      ", r"     / ---- \      "],
 ]
 
 HAT_HAPPY_FACE = [r"     | ^  ^ |      ", r"     / \vv/ \      "]
-
 HAT_BRIM = r"  __/````````\__   "
 
 def hat_think(frame_idx):
@@ -194,11 +286,10 @@ def hat_think(frame_idx):
 def hat_happy():
     return HAT_BODY + HAT_HAPPY_FACE + [HAT_BRIM]
 
-HAT_H = len(HAT_BODY) + 2 + 1  # body + face + brim
+HAT_H = len(HAT_BODY) + 2 + 1
 
 HAT_DROP_FRAMES = []
 _full = hat_think(0)
-_pad = len(_full)
 for offset in range(4, 0, -1):
     frame = ["                    "] * offset + _full + ["                    "] * (4 - offset)
     HAT_DROP_FRAMES.append(frame)
@@ -236,7 +327,6 @@ def render_bubble(lines, width, tail=False):
     for line in lines:
         out.append("  \u2502 " + line.ljust(width) + " \u2502")
     if tail:
-        # Bottom with smooth diagonal tail
         out.append("  \u2514\u2500\u2500\u2500" + "\u2500" * (width - 1) + "\u2518")
         out.append("     \\")
         out.append("      \\")
@@ -246,26 +336,21 @@ def render_bubble(lines, width, tail=False):
     return out
 
 def render_thinking(thinking_text, frame_idx, fname):
-    """Render: speech bubble + hat + filename shelf."""
     hat_lines = hat_think(frame_idx)
-
     all_lines = wrap_text(thinking_text, BUBBLE_W)
     visible = all_lines[-3:] if len(all_lines) > 3 else all_lines
     while len(visible) < 2:
         visible.insert(0, "")
     bubble = render_bubble(visible, BUBBLE_W, tail=True)
-
     out = bubble
     out += [f"  {YELLOW}{line}{RESET}" for line in hat_lines]
     out.append(f"    {DIM}{fname}{RESET}")
     return out
 
 def render_result(name, fname):
-    """Render final: hat happy + new name."""
     pad = BUBBLE_W - len(name)
     bubble = render_bubble(["PLACEHOLDER"], BUBBLE_W, tail=True)
     bubble[1] = f"  \u2502 {BOLD}{GREEN}{name}{RESET}" + " " * max(0, pad) + " \u2502"
-
     hat_lines = hat_happy()
     out = bubble
     out += [f"  {YELLOW}{line}{RESET}" for line in hat_lines]
@@ -281,19 +366,17 @@ def clear_and_draw(lines, prev_line_count):
     return len(lines)
 
 # === Drop animation ===
-write_tty("\033[?25l")  # hide cursor
+write_tty("\033[?25l")
 
-# Reserve space and show filename
-total_h = 17  # bubble(4) + arrow(3) + hat(6) + shelf(2) + padding(2)
+total_h = 17
 write_tty("\n" * total_h)
-write_tty(f"\033[{total_h}A")  # go back up
+write_tty(f"\033[{total_h}A")
 prev_count = 0
 
 for i, drop_frame in enumerate(HAT_DROP_FRAMES):
     frame = []
     for line in drop_frame:
         frame.append(f"  {YELLOW}{line}{RESET}")
-    # Pad to fixed height
     while len(frame) < HAT_H + 4:
         frame.append("")
     frame.append(f"    {DIM}{filename}{RESET}")
@@ -305,7 +388,6 @@ time.sleep(0.2)
 frame_lines = render_thinking("Hmm, interesting...", 0, filename)
 prev_count = clear_and_draw(frame_lines, prev_count)
 
-# Make streaming request
 headers = {"Content-Type": "application/json"}
 if api_key:
     headers["Authorization"] = f"Bearer {api_key}"
@@ -373,7 +455,6 @@ try:
                             answer_buf = ""
                         continue
 
-                # Render at ~10fps
                 now = time.time()
                 if now - last_render > 0.1:
                     display = thinking_buf[-BUBBLE_W * 3:] if thinking_buf else "Hmm..."
@@ -384,53 +465,67 @@ try:
                     last_render = now
 
 except Exception as e:
-    write_tty(f"\033[?25h")  # show cursor
+    write_tty(f"\033[?25h")
     write_tty(f"\n  error: {e}\n")
     if tty is not None:
         os.close(tty)
     sys.exit(1)
 
-# Extract answer
-answer = answer_buf
-answer = re.sub(r"<think>.*?</think>", "", answer, flags=re.DOTALL).strip()
-
-# Sanitize filename
-lines = [l.strip().strip("`\"'") for l in answer.split("\n") if l.strip()]
-name = lines[-1] if lines else ""
-name = name.split("/")[-1]
-name = re.sub(r"[^a-zA-Z0-9._-]", "-", name)
-name = re.sub(r"-+", "-", name).strip("-")
-
-# === Result reveal ===
-if name:
-    frame_lines = render_result(name, filename)
-    prev_count = clear_and_draw(frame_lines, prev_count)
-    write_tty("\n")
-
-write_tty(f"\033[?25h")  # show cursor
-
+# Print raw answer for bash to sanitize via shared sanitize_name
+raw = answer_buf
+write_tty(f"\033[?25h")
 if tty is not None:
     os.close(tty)
-
-# Output filename to stdout for scripting
-print(name)
+print(raw)
 PYEOF
+)
+
+  local name
+  name=$(sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext")
+
+  # Re-render the result with the final name (on tty)
+  if [[ -n "$name" ]] && [[ -t 2 ]]; then
+    python3 - "$name" "$fname" <<'REVEAL'
+import sys, os
+name, fname = sys.argv[1], sys.argv[2]
+BOLD, GREEN, YELLOW, RESET = '\033[1m', '\033[32m', '\033[33m', '\033[0m'
+BUBBLE_W = 44
+tty = os.open('/dev/tty', os.O_WRONLY) if os.path.exists('/dev/tty') else None
+def w(s):
+    if tty: os.write(tty, s.encode())
+    else: sys.stderr.write(s); sys.stderr.flush()
+hat = [r"        /\         ", r"       /  '.       ", r"      / .-'        ",
+       r"     | ^  ^ |      ", r"     / \vv/ \      ", r"  __/````````\__   "]
+pad = BUBBLE_W - len(name)
+w('\u250c' + '\u2500'*(BUBBLE_W+2) + '\u2510\n')
+w('\u2502 ' + f'{BOLD}{GREEN}{name}{RESET}' + ' '*max(0,pad) + ' \u2502\n')
+w('\u2514\u2500\u2500\u2500' + '\u2500'*(BUBBLE_W-1) + '\u2518\n')
+w('     \\\n      \\\n       |\n')
+for l in hat: w(f'  {YELLOW}{l}{RESET}\n')
+w(f'    {BOLD}{GREEN}{name}{RESET}\n\n')
+if tty: os.close(tty)
+REVEAL
+  fi
+
+  echo "$name"
 }
 
 # Non-animated fallback
 suggest_quiet() {
-  local file="$1"
-  local mode="$2"
-  local preserve_ext="$3"
+  local file="$1" mode="$2" preserve_ext="$3" metadata="${4:-}"
+  local orig_ext=""
+  if [[ "$preserve_ext" == "true" && "$file" == *.* ]]; then
+    orig_ext="${file##*.}"
+  fi
 
   local payload
-  payload=$(build_payload "$file" "$mode" "$preserve_ext")
+  payload=$(build_payload "$file" "$mode" "$preserve_ext" "$metadata")
 
-  echo "$payload" | python3 -c "
+  local raw_answer
+  raw_answer=$(echo "$payload" | python3 -c "
 import json, sys, re, urllib.request, os
 
 payload = sys.stdin.read().encode()
-# Switch off streaming for quiet mode
 p = json.loads(payload)
 p['stream'] = False
 payload = json.dumps(p).encode()
@@ -448,16 +543,10 @@ with urllib.request.urlopen(req, timeout=300) as resp:
     data = json.loads(resp.read())
 
 content = data['choices'][0]['message']['content']
-content = re.sub(r'<think>.*?</think>', '', content, flags=re.DOTALL).strip()
+print(content)
+" 2>&1)
 
-lines = [l.strip().strip('\`\"') for l in content.split('\n') if l.strip()]
-name = lines[-1] if lines else ''
-name = name.split('/')[-1]
-import re as _re
-name = _re.sub(r'[^a-zA-Z0-9._-]', '-', name)
-name = _re.sub(r'-+', '-', name).strip('-')
-print(name)
-" 2>&1
+  sanitize_name "$raw_answer" "$preserve_ext" "$orig_ext"
 }
 
 process_file() {
@@ -477,6 +566,12 @@ process_file() {
   local dir
   dir=$(dirname "$file")
 
+  # Guard clause: skip files with descriptive names unless --force
+  if [[ "$FORCE" != "true" ]] && ! filename_needs_renaming "$basename"; then
+    echo "  $basename: name looks good, skipping (use --force to override)" >&2
+    return 0
+  fi
+
   local mode="text"
   if [[ "$force_image" == "true" ]] || is_image "$file"; then
     mode="image"
@@ -487,13 +582,19 @@ process_file() {
     return 1
   fi
 
+  # Collect metadata
+  local metadata=""
+  if [[ "$INCLUDE_METADATA" == "true" ]]; then
+    metadata=$(collect_metadata "$file" "$mode" 2>/dev/null) || metadata=""
+  fi
+
   local suggested
   if [[ "$quiet" == "true" ]] || ! [[ -t 2 ]]; then
     echo -n "  $basename → " >&2
-    suggested=$(suggest_quiet "$file" "$mode" "$preserve_ext")
+    suggested=$(suggest_quiet "$file" "$mode" "$preserve_ext" "$metadata")
     echo "$suggested" >&2
   else
-    suggested=$(stream_with_hat "$file" "$mode" "$preserve_ext")
+    suggested=$(stream_with_hat "$file" "$mode" "$preserve_ext" "$metadata")
   fi
 
   if [[ -z "$suggested" ]]; then
@@ -560,6 +661,9 @@ BATCH=false
 FORCE_IMAGE=false
 PRESERVE_EXT=true
 QUIET=false
+CONTEXT=""
+INCLUDE_METADATA=true
+FORCE=false
 FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -574,6 +678,9 @@ while [[ $# -gt 0 ]]; do
     --quiet|-q) QUIET=true; shift ;;
     --budget|-rb) REASONING_BUDGET="$2"; shift 2 ;;
     --nothink) REASONING_BUDGET=0; shift ;;
+    --context|-c) CONTEXT="$2"; shift 2 ;;
+    --no-metadata) INCLUDE_METADATA=false; shift ;;
+    --force|-f) FORCE=true; shift ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac

@@ -36,8 +36,11 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Quiet mode for scripting (`--quiet` / `-q`)
 - Disable reasoning/thinking tokens (`--nothink`) for faster inference or models that don't support them
 - Batch processing for entire directories (processes files sequentially)
+- Smart guard clause skips files that already have descriptive names (`--force` to override)
+- Additional context for guided naming (`--context` / `-c`)
+- File metadata (EXIF, timestamps, MIME type) included in LLM context (`--no-metadata` to disable)
 - Interactive rename with confirmation
-- Preserves original file extension by default
+- Robust extension handling: isolates name stem from extension for reliable results with smaller models
 
 ## Requirements
 
@@ -45,6 +48,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Python 3.6+
 - An OpenAI-compatible LLM API endpoint
 - For image naming: a vision-capable model (e.g., GPT-4o, LLaVA, Qwen-VL)
+- Optional: `Pillow` (`pip install Pillow`) for EXIF metadata extraction from images
 
 ## Installation
 
@@ -133,6 +137,15 @@ hat --no-ext mystery-file
 
 # Disable reasoning/thinking tokens
 hat --nothink photo.jpg
+
+# Provide context to guide naming
+hat -c "quarterly finance report" document.pdf
+
+# Process all files, even those with good names
+hat --batch --force ~/Downloads/
+
+# Skip metadata collection
+hat --no-metadata photo.jpg
 ```
 
 ### Scripting
@@ -153,10 +166,12 @@ done
 
 ## How it works
 
-1. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format.
-2. **LLM query**: Sends the content to your configured LLM with a prompt asking for a descriptive kebab-case filename.
-3. **Streaming display**: Shows the model's reasoning tokens in a speech bubble above the animated hat (supports both `reasoning_content` field and `<think>` tags).
-4. **Name sanitization**: Cleans the response into a valid filename (lowercase, hyphens, no special characters).
+1. **Guard clause**: Checks if the filename already looks descriptive (skips camera defaults like `IMG_1234`, screenshots, UUIDs, etc.). Use `--force` to override.
+2. **Metadata collection**: Gathers file metadata (size, modification date, MIME type, EXIF for images) to give the LLM more context. Use `--no-metadata` to skip.
+3. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format.
+4. **LLM query**: Sends the content, metadata, and any user context (`--context`) to your configured LLM with a prompt asking for a descriptive kebab-case filename.
+5. **Streaming display**: Shows the model's reasoning tokens in a speech bubble above the animated hat (supports both `reasoning_content` field and `<think>` tags).
+6. **Name sanitization**: Cleans the response into a valid filename. When preserving extensions (default), the model only generates the name stem and the original extension is appended automatically.
 
 ## The Animation
 
