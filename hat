@@ -429,13 +429,14 @@ def render_thinking(thinking_text, frame_idx, fname):
     return out
 
 def render_result(name, fname):
-    pad = BUBBLE_W - len(name)
+    suggestion = f"I suggest: {name}"
+    pad = BUBBLE_W - len(suggestion)
     bubble = render_bubble(["PLACEHOLDER"], BUBBLE_W, tail=True)
-    bubble[1] = f"  \u2502 {BOLD}{GREEN}{name}{RESET}" + " " * max(0, pad) + " \u2502"
+    bubble[1] = f"  \u2502 {BOLD}{GREEN}{suggestion}{RESET}" + " " * max(0, pad) + " \u2502"
     hat_lines = hat_happy()
     out = bubble
     out += [f"  {YELLOW}{line}{RESET}" for line in hat_lines]
-    out.append(f"    {BOLD}{GREEN}{name}{RESET}")
+    out.append(f"    {DIM}{fname}{RESET}")
     return out
 
 def clear_and_draw(lines, prev_line_count):
@@ -585,13 +586,15 @@ def w(s):
     else: sys.stderr.write(s); sys.stderr.flush()
 hat = [r"        /\         ", r"       /  '.       ", r"      / .-'        ",
        r"     | ^  ^ |      ", r"     / \vv/ \      ", r"  __/````````\__   "]
-pad = BUBBLE_W - len(name)
+suggestion = f'I suggest: {name}'
+pad = BUBBLE_W - len(suggestion)
 w('\u250c' + '\u2500'*(BUBBLE_W+2) + '\u2510\n')
-w('\u2502 ' + f'{BOLD}{GREEN}{name}{RESET}' + ' '*max(0,pad) + ' \u2502\n')
+w('\u2502 ' + f'{BOLD}{GREEN}{suggestion}{RESET}' + ' '*max(0,pad) + ' \u2502\n')
 w('\u2514\u2500\u2500\u2500' + '\u2500'*(BUBBLE_W-1) + '\u2518\n')
 w('     \\\n      \\\n       |\n')
+DIM = '\033[2m'
 for l in hat: w(f'  {YELLOW}{l}{RESET}\n')
-w(f'    {BOLD}{GREEN}{name}{RESET}\n\n')
+w(f'    {DIM}{fname}{RESET}\n\n')
 if tty: os.close(tty)
 REVEAL
   fi
@@ -756,7 +759,7 @@ process_file() {
       mv "$file" "$target"
       echo "  Renamed → $target" >&2
     else
-      read -r -p "  Rename $suggested? [y/N] " confirm </dev/tty
+      read -r -p "  Rename $basename to $suggested? [y/N] " confirm </dev/tty
       if [[ "$confirm" =~ ^[Yy] ]]; then
         mv "$file" "$target"
         echo "  Renamed → $target" >&2
