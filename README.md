@@ -27,6 +27,19 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 ![Visual demonstration of hat](./hat.gif)  
 
 
+## Changelog
+
+- Auto-enumerate duplicate filenames in batch mode (#9)
+- Isolate extension from model output for reliable results with small models (#1)
+- `--context` / `-c` flag for guided naming (#2)
+- File metadata (size, mtime, MIME, EXIF) in LLM context (#3), `--no-metadata` to opt out
+- LLM guard clause skips already-descriptive filenames (#4), `--force` to override
+- `--nothink` / `--fullthink` to control reasoning for guard clause and naming
+- Animation shows original filename until rename is confirmed (#11)
+- Bats test suite with mock LLM server (#10)
+- Content-based binary/image detection via `file(1)` and magic bytes
+- Proper error handling for LLM connection failures
+
 ## Features
 
 - Animated Sorting Hat with drop animation, blinking eyes, and streaming thought bubble
