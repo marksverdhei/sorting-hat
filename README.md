@@ -55,6 +55,16 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Interactive rename with confirmation
 - Robust extension handling: isolates name stem from extension for reliable results with smaller models
 
+## Supported Formats
+
+| Format | How it works |
+|--------|-------------|
+| **Text files** (.txt, .md, .py, .json, .csv, .xml, .html, etc.) | First 4KB of content sent to the LLM |
+| **Images** (JPEG, PNG, SVG) | Base64-encoded and sent via multimodal API |
+| **Images** (WebP, BMP, TIFF, GIF) | Converted to PNG via Pillow, then sent as above |
+
+Audio, video, and other binary files are not supported. Image naming requires a vision-capable model.
+
 ## Requirements
 
 - Bash 4+
