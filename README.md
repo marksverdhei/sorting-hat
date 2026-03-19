@@ -43,7 +43,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 ## Features
 
 - Animated Sorting Hat with drop animation, blinking eyes, and streaming thought bubble
-- Supports both text files and images (via vision/multimodal models)
+- Supports text files and images including JPEG, PNG, GIF, BMP, TIFF, WebP, and SVG (via vision/multimodal models)
 - Auto-detects image files by extension
 - Handles reasoning/thinking tokens from models like Qwen, DeepSeek, etc.
 - Quiet mode for scripting (`--quiet` / `-q`)
