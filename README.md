@@ -52,7 +52,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - LLM-powered guard clause skips files that already have descriptive names using a two-turn conversation (`--force` to override)
 - Additional context for guided naming (`--context` / `-c`)
 - File metadata (EXIF, timestamps, MIME type) included in LLM context (`--no-metadata` to disable)
-- Interactive rename with confirmation
+- Interactive rename with confirmation (`--yes` / `-y` to auto-rename without prompting)
 - Robust extension handling: isolates name stem from extension for reliable results with smaller models
 
 ## Requirements
@@ -133,6 +133,9 @@ hat photo.jpg
 
 # Suggest and prompt to rename
 hat --rename IMG_20240301_143022.jpg
+
+# Auto-rename without confirmation
+hat -y IMG_20240301_143022.jpg
 
 # Process all files in a directory
 hat --batch ~/Downloads/
