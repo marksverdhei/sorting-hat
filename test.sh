@@ -13,8 +13,9 @@ setup_file() {
   eval "$(sed -n '/^sanitize_name/,/^}/p' "$HAT")"
   eval "$(sed -n '/^is_binary/,/^}/p' "$HAT")"
   eval "$(sed -n '/^is_audio/,/^}/p' "$HAT")"
+  eval "$(sed -n '/^is_video/,/^}/p' "$HAT")"
   eval "$(sed -n '/^collect_metadata/,/^}/p' "$HAT")"
-  export -f sanitize_name is_binary is_audio collect_metadata
+  export -f sanitize_name is_binary is_audio is_video collect_metadata
 
   # Start mock LLM server that handles multi-turn conversations
   export MOCK_PORT=18950
@@ -295,4 +296,53 @@ teardown_file() {
 @test "audio: wav is processed (not skipped as binary)" {
   run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.wav' 2>/dev/null"
   assert_output "suggested-name.wav"
+}
+
+# ── Video detection ──────────────────────────────────────────────────
+
+@test "video: mp4 is detected as video" {
+  run is_video "$TEST_ASSETS/sample.mp4"
+  assert_success
+}
+
+@test "video: webm is detected as video" {
+  run is_video "$TEST_ASSETS/sample.webm"
+  assert_success
+}
+
+@test "video: mkv is detected as video" {
+  run is_video "$TEST_ASSETS/sample.mkv"
+  assert_success
+}
+
+@test "video: text file is not video" {
+  run is_video "$TEST_ASSETS/sample.txt"
+  assert_failure
+}
+
+@test "video: audio file is not video" {
+  run is_video "$TEST_ASSETS/sample.mp3"
+  assert_failure
+}
+
+@test "video: m4a is not detected as video" {
+  run is_video "$TEST_ASSETS/sample.m4a"
+  assert_failure
+}
+
+# ── Video integration ────────────────────────────────────────────────
+
+@test "video: mp4 is processed (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.mp4' 2>/dev/null"
+  assert_output "suggested-name.mp4"
+}
+
+@test "video: webm is processed (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.webm' 2>/dev/null"
+  assert_output "suggested-name.webm"
+}
+
+@test "video: mkv is processed (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.mkv' 2>/dev/null"
+  assert_output "suggested-name.mkv"
 }
