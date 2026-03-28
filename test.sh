@@ -12,8 +12,9 @@ setup_file() {
   # Source testable bash functions
   eval "$(sed -n '/^sanitize_name/,/^}/p' "$HAT")"
   eval "$(sed -n '/^is_binary/,/^}/p' "$HAT")"
+  eval "$(sed -n '/^is_audio/,/^}/p' "$HAT")"
   eval "$(sed -n '/^collect_metadata/,/^}/p' "$HAT")"
-  export -f sanitize_name is_binary collect_metadata
+  export -f sanitize_name is_binary is_audio collect_metadata
 
   # Start mock LLM server that handles multi-turn conversations
   export MOCK_PORT=18950
@@ -222,4 +223,76 @@ teardown_file() {
   run bash -c "LLM_BASE_URL=http://127.0.0.1:19999 bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.txt' 2>&1"
   assert_output --partial "could not reach LLM"
   refute_output --partial "Traceback"
+}
+
+# ── Audio detection ──────────────────────────────────────────────────
+
+@test "audio: mp3 is detected as audio" {
+  run is_audio "$TEST_ASSETS/sample.mp3"
+  assert_success
+}
+
+@test "audio: wav is detected as audio" {
+  run is_audio "$TEST_ASSETS/sample.wav"
+  assert_success
+}
+
+@test "audio: flac is detected as audio" {
+  run is_audio "$TEST_ASSETS/sample.flac"
+  assert_success
+}
+
+@test "audio: ogg is detected as audio" {
+  run is_audio "$TEST_ASSETS/sample.ogg"
+  assert_success
+}
+
+@test "audio: aac is detected as audio" {
+  run is_audio "$TEST_ASSETS/sample.aac"
+  assert_success
+}
+
+@test "audio: m4a is detected as audio" {
+  run is_audio "$TEST_ASSETS/sample.m4a"
+  assert_success
+}
+
+@test "audio: text file is not audio" {
+  run is_audio "$TEST_ASSETS/sample.txt"
+  assert_failure
+}
+
+@test "audio: image file is not audio" {
+  run is_audio "$TEST_ASSETS/sample.jpg"
+  assert_failure
+}
+
+# ── Audio metadata ───────────────────────────────────────────────────
+
+@test "audio metadata: mp3 has size and modified" {
+  run collect_metadata "$TEST_ASSETS/sample.mp3" "audio"
+  assert_output --partial "size_bytes"
+  assert_output --partial "modified"
+}
+
+@test "audio metadata: mp3 has mime_type" {
+  run collect_metadata "$TEST_ASSETS/sample.mp3" "audio"
+  assert_output --partial "mime_type"
+}
+
+# ── Audio integration ────────────────────────────────────────────────
+
+@test "audio: mp3 is processed (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.mp3' 2>/dev/null"
+  assert_output "suggested-name.mp3"
+}
+
+@test "audio: flac is processed (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.flac' 2>/dev/null"
+  assert_output "suggested-name.flac"
+}
+
+@test "audio: wav is processed (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.wav' 2>/dev/null"
+  assert_output "suggested-name.wav"
 }

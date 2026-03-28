@@ -43,8 +43,8 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 ## Features
 
 - Animated Sorting Hat with drop animation, blinking eyes, and streaming thought bubble
-- Supports text files and images including JPEG, PNG, GIF, BMP, TIFF, WebP, and SVG (via vision/multimodal models)
-- Auto-detects image files by extension
+- Supports text files, images (JPEG, PNG, GIF, BMP, TIFF, WebP, SVG), and audio files (MP3, WAV, FLAC, OGG, AAC, M4A)
+- Auto-detects image and audio files by magic bytes and extension
 - Handles reasoning/thinking tokens from models like Qwen, DeepSeek, etc.
 - Quiet mode for scripting (`--quiet` / `-q`)
 - Configurable reasoning: guard clause defaults to no thinking, naming uses thinking. `--nothink` disables both, `--fullthink` enables both
@@ -62,6 +62,7 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - An OpenAI-compatible LLM API endpoint
 - For image naming: a vision-capable model (e.g., GPT-4o, LLaVA, Qwen-VL)
 - Optional: `Pillow` (`pip install Pillow`) for EXIF metadata extraction from images
+- Optional: `ffprobe` (from `ffmpeg`) for richer audio metadata (tags, duration, bitrate, codec)
 
 ## Installation
 
@@ -188,7 +189,7 @@ done
 
 1. **Guard clause**: Asks the LLM whether the current filename is already descriptive. If yes, skips the file. If no, the check conversation becomes context for the naming request (two-turn multi-turn). Use `--force` to skip the check entirely.
 2. **Metadata collection**: Gathers file metadata (size, modification date, MIME type, EXIF for images) to give the LLM more context. Use `--no-metadata` to skip.
-3. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format.
+3. **File analysis**: For text files, reads the first 4KB of content. For images, base64-encodes and sends via the OpenAI multimodal format. For audio files, extracts tags, duration, bitrate, and codec via `ffprobe` (if available) and passes them as text context — no audio bytes are sent to the LLM.
 4. **LLM query**: Sends the content, metadata, and any user context (`--context`) to your configured LLM with a prompt asking for a descriptive kebab-case filename. When the guard clause ran first, this becomes a multi-turn conversation with richer context.
 5. **Streaming display**: Shows the model's reasoning tokens in a speech bubble above the animated hat (supports both `reasoning_content` field and `<think>` tags).
 6. **Name sanitization**: Cleans the response into a valid filename. When preserving extensions (default), the model only generates the name stem and the original extension is appended automatically.
