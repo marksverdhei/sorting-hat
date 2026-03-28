@@ -38,6 +38,7 @@ Options:
   --context, -c     Additional context to guide naming (e.g. "Q3 marketing")
   --no-metadata     Don't include file metadata in LLM context
   --force, -f       Skip name quality check, always suggest a new name
+  --preview, -p     Show a content preview before suggesting a name
 
 Environment:
   LLM_BASE_URL             OpenAI-compatible base URL (default: http://localhost:8080)
@@ -245,6 +246,77 @@ CHECKEOF
     return 1  # name is already good
   fi
   return 0  # needs renaming
+}
+
+# Print a content preview to stderr before processing.
+# Text: first 8 lines. Audio: key tags. Image: dimensions + EXIF summary.
+show_preview() {
+  local file="$1" mode="$2"
+  local fname
+  fname=$(basename "$file")
+
+  echo "  ── preview: $fname ──" >&2
+
+  if [[ "$mode" == "text" ]]; then
+    head -8 "$file" 2>/dev/null | sed 's/^/  /' >&2
+    local lines
+    lines=$(wc -l < "$file" 2>/dev/null || echo "?")
+    echo "  [${lines} lines total]" >&2
+
+  elif [[ "$mode" == "audio" ]]; then
+    python3 - "$file" <<'PREVIEWEOF' >&2
+import sys, subprocess, json
+file = sys.argv[1]
+try:
+    result = subprocess.run(
+        ['ffprobe', '-v', 'quiet', '-print_format', 'json', '-show_format', file],
+        capture_output=True, text=True, timeout=5
+    )
+    if result.returncode == 0:
+        fmt = json.loads(result.stdout).get('format', {})
+        tags = {k.lower(): v for k, v in fmt.get('tags', {}).items()}
+        for key in ('title', 'artist', 'album', 'date', 'genre'):
+            if tags.get(key):
+                print(f"  {key.capitalize()}: {tags[key]}")
+        if fmt.get('duration'):
+            secs = float(fmt['duration'])
+            print(f"  Duration: {int(secs//60)}:{int(secs%60):02d}")
+    else:
+        print(f"  (ffprobe unavailable)")
+except Exception as e:
+    print(f"  (preview error: {e})")
+PREVIEWEOF
+
+  elif [[ "$mode" == "image" ]]; then
+    python3 - "$file" <<'PREVIEWEOF' >&2
+import sys
+file = sys.argv[1]
+try:
+    from PIL import Image
+    with Image.open(file) as img:
+        print(f"  Size: {img.width}x{img.height}  Mode: {img.mode}")
+        exif = img.getexif()
+        if exif:
+            from PIL.ExifTags import TAGS
+            shown = 0
+            for tid, val in exif.items():
+                tag = TAGS.get(tid, tid)
+                if tag in ('Make', 'Model', 'DateTime', 'Software') and isinstance(val, str):
+                    print(f"  {tag}: {val}")
+                    shown += 1
+                    if shown >= 3:
+                        break
+except ImportError:
+    import subprocess
+    result = subprocess.run(['file', '--brief', '--mime-type', file],
+                           capture_output=True, text=True)
+    print(f"  {result.stdout.strip()}")
+except Exception as e:
+    print(f"  (preview error: {e})")
+PREVIEWEOF
+  fi
+
+  echo "" >&2
 }
 
 # Collect file metadata as JSON
@@ -803,6 +875,11 @@ process_file() {
     return 0
   fi
 
+  # Optional content preview
+  if [[ "$PREVIEW" == "true" ]]; then
+    show_preview "$file" "$mode"
+  fi
+
   # Collect metadata
   local metadata=""
   if [[ "$INCLUDE_METADATA" == "true" ]]; then
@@ -910,6 +987,7 @@ QUIET=false
 CONTEXT=""
 INCLUDE_METADATA=true
 FORCE=false
+PREVIEW=false
 FILES=()
 
 while [[ $# -gt 0 ]]; do
@@ -928,6 +1006,7 @@ while [[ $# -gt 0 ]]; do
     --context|-c) CONTEXT="$2"; shift 2 ;;
     --no-metadata) INCLUDE_METADATA=false; shift ;;
     --force|-f) FORCE=true; shift ;;
+    --preview|-p) PREVIEW=true; shift ;;
     -*) echo "Unknown option: $1" >&2; exit 1 ;;
     *) FILES+=("$1"); shift ;;
   esac
