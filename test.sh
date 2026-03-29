@@ -12,8 +12,9 @@ setup_file() {
   # Source testable bash functions
   eval "$(sed -n '/^sanitize_name/,/^}/p' "$HAT")"
   eval "$(sed -n '/^is_binary/,/^}/p' "$HAT")"
+  eval "$(sed -n '/^is_image/,/^}/p' "$HAT")"
   eval "$(sed -n '/^collect_metadata/,/^}/p' "$HAT")"
-  export -f sanitize_name is_binary collect_metadata
+  export -f sanitize_name is_binary is_image collect_metadata
 
   # Start mock LLM server that handles multi-turn conversations
   export MOCK_PORT=18950
@@ -106,6 +107,23 @@ teardown_file() {
   assert_output "sunset-view.pdf"
 }
 
+# ── Sanitize name: additional edge cases ───────────────────────────
+
+@test "sanitize: collapses multiple spaces/hyphens to single hyphen" {
+  run sanitize_name "my  report  doc" "true" "pdf"
+  assert_output "my-report-doc.pdf"
+}
+
+@test "sanitize: strips surrounding quotes" {
+  run sanitize_name '"quoted-name"' "true" "txt"
+  assert_output "quoted-name.txt"
+}
+
+@test "sanitize: multiline input uses last non-empty line" {
+  run sanitize_name $'first-line\nsecond-name' "true" "txt"
+  assert_output "second-name.txt"
+}
+
 # ── Binary detection ─────────────────────────────────────────────────
 
 @test "binary: text file is not binary" {
@@ -126,6 +144,75 @@ teardown_file() {
 @test "binary: html is not binary" {
   run is_binary "$TEST_ASSETS/sample.html"
   assert_failure
+}
+
+# ── Image detection ─────────────────────────────────────────────────
+
+@test "image: jpg is detected as image" {
+  run is_image "$TEST_ASSETS/sample.jpg"
+  assert_success
+}
+
+@test "image: jpeg is detected as image" {
+  run is_image "$TEST_ASSETS/sample.jpeg"
+  assert_success
+}
+
+@test "image: png is detected as image" {
+  run is_image "$TEST_ASSETS/sample.png"
+  assert_success
+}
+
+@test "image: gif is detected as image" {
+  run is_image "$TEST_ASSETS/sample.gif"
+  assert_success
+}
+
+@test "image: bmp is detected as image" {
+  run is_image "$TEST_ASSETS/sample.bmp"
+  assert_success
+}
+
+@test "image: tiff is detected as image" {
+  run is_image "$TEST_ASSETS/sample.tiff"
+  assert_success
+}
+
+@test "image: svg is detected as image (extension fallback)" {
+  run is_image "$TEST_ASSETS/sample.svg"
+  assert_success
+}
+
+@test "image: webp is detected as image" {
+  run is_image "$TEST_ASSETS/sample.webp"
+  assert_success
+}
+
+@test "image: text file is not an image" {
+  run is_image "$TEST_ASSETS/sample.txt"
+  assert_failure
+}
+
+@test "image: html file is not an image" {
+  run is_image "$TEST_ASSETS/sample.html"
+  assert_failure
+}
+
+@test "image: binary .bin is not an image" {
+  run is_image "$TEST_ASSETS/sample.bin"
+  assert_failure
+}
+
+# ── Image integration ─────────────────────────────────────────────────
+
+@test "image: jpg is processed as image (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.jpg' 2>/dev/null"
+  assert_output "suggested-name.jpg"
+}
+
+@test "image: png is processed as image (not skipped as binary)" {
+  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.png' 2>/dev/null"
+  assert_output "suggested-name.png"
 }
 
 # ── Metadata collection ─────────────────────────────────────────────
