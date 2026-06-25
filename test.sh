@@ -354,6 +354,76 @@ teardown_file() {
   assert_failure
 }
 
+# ── ftyp-box brand discrimination (regression: HEIC / MP4 video / MOV
+# / 3GP all carry the ftyp marker. Major brand at bytes 8-11 is what
+# distinguishes audio from video/image — the brand check must reject
+# everything except M4A / M4B / M4P.) ─────────────────────────────────
+
+@test "audio: MP4 isom container is NOT audio" {
+  local tmp; tmp=$(mktemp --suffix=.mp4)
+  # 8B box size + "ftyp" + "isom" + 4 bytes filler
+  printf '\x00\x00\x00\x20ftypisom\x00\x00\x02\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_failure
+}
+
+@test "audio: MP4 mp42 container is NOT audio" {
+  local tmp; tmp=$(mktemp --suffix=.mp4)
+  printf '\x00\x00\x00\x20ftypmp42\x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_failure
+}
+
+@test "audio: QuickTime mov is NOT audio" {
+  local tmp; tmp=$(mktemp --suffix=.mov)
+  printf '\x00\x00\x00\x20ftypqt  \x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_failure
+}
+
+@test "audio: HEIC iPhone photo is NOT audio" {
+  local tmp; tmp=$(mktemp --suffix=.heic)
+  printf '\x00\x00\x00\x20ftypheic\x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_failure
+}
+
+@test "audio: HEIF mif1 brand is NOT audio" {
+  local tmp; tmp=$(mktemp --suffix=.heif)
+  printf '\x00\x00\x00\x20ftypmif1\x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_failure
+}
+
+@test "audio: 3GP is NOT audio" {
+  local tmp; tmp=$(mktemp --suffix=.3gp)
+  printf '\x00\x00\x00\x20ftyp3gp4\x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_failure
+}
+
+@test "audio: synthetic M4A brand IS audio" {
+  local tmp; tmp=$(mktemp --suffix=.m4a)
+  printf '\x00\x00\x00\x20ftypM4A \x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_success
+}
+
+@test "audio: M4B audiobook IS audio" {
+  local tmp; tmp=$(mktemp --suffix=.m4b)
+  printf '\x00\x00\x00\x20ftypM4B \x00\x00\x00\x00' > "$tmp"
+  run is_audio "$tmp"
+  rm -f "$tmp"
+  assert_success
+}
+
 # ── Audio metadata ───────────────────────────────────────────────────
 
 @test "audio metadata: mp3 has size and modified" {

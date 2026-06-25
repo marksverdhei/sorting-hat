@@ -88,8 +88,16 @@ is_audio() {
   [[ "$magic" == fff1* || "$magic" == fff9* ]] && return 0
   # WAV: RIFF (52 49 46 46) + WAVE at offset 8 (57 41 56 45)
   [[ "$magic" == 52494646* ]] && [[ "${magic:16:8}" == "57415645" ]] && return 0
-  # M4A / AAC in MP4: ftyp box — check bytes 4-7 for 66 74 79 70
-  [[ "${magic:8:8}" == "66747970" ]] && return 0
+  # M4A / M4B / M4P: ftyp box at bytes 4-7 (66 74 79 70) AND audio major brand
+  # at bytes 8-11 (M4A / M4B / M4P). The ftyp marker alone matches all
+  # ISO-BMFF containers — MP4 video (isom/mp42), QuickTime, HEIC iPhone images,
+  # 3GP — so without the brand check this is_audio call gave false positives
+  # for the whole iPhone-photos / video files surface.
+  if [[ "${magic:8:8}" == "66747970" ]]; then
+    case "${magic:16:8}" in
+      4d344120|4d344220|4d345020) return 0 ;;
+    esac
+  fi
   # Fall back to extension
   local ext="${file##*.}"
   ext="${ext,,}"
