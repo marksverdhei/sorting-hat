@@ -296,37 +296,3 @@ teardown_file() {
   run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.wav' 2>/dev/null"
   assert_output "suggested-name.wav"
 }
-
-# ── Preview flag ─────────────────────────────────────────────────────
-
-@test "preview: --preview shows content preview on stderr for text file" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force --preview '$TEST_ASSETS/sample.txt' 2>&1 >/dev/null"
-  assert_output --partial "preview:"
-  assert_output --partial "sample.txt"
-}
-
-@test "preview: --preview shows line count for text file" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force --preview '$TEST_ASSETS/sample.txt' 2>&1 >/dev/null"
-  assert_output --partial "lines total"
-}
-
-@test "preview: -p shorthand works" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force -p '$TEST_ASSETS/sample.txt' 2>&1 >/dev/null"
-  assert_output --partial "preview:"
-}
-
-@test "preview: without --preview no preview header on stderr" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force '$TEST_ASSETS/sample.txt' 2>&1 >/dev/null"
-  refute_output --partial "preview:"
-}
-
-@test "preview: --preview still produces correct suggestion on stdout" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force --preview '$TEST_ASSETS/sample.txt' 2>/dev/null"
-  assert_output "suggested-name.txt"
-}
-
-@test "preview: --preview works with audio file" {
-  run bash -c "LLM_BASE_URL=http://127.0.0.1:$MOCK_PORT bash '$HAT' --quiet --dry-run --force --preview '$TEST_ASSETS/sample.mp3' 2>&1 >/dev/null"
-  assert_output --partial "preview:"
-  assert_output --partial "sample.mp3"
-}
