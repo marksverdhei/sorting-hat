@@ -72,6 +72,30 @@ is_binary() {
   [[ "$mime" == "binary" ]]
 }
 
+# Detect audio by magic bytes first, then fall back to extension
+is_audio() {
+  local file="$1"
+  local magic
+  magic=$(head -c 12 "$file" 2>/dev/null | od -A n -t x1 -N 12 2>/dev/null | tr -d ' \n')
+  # MP3: ID3 tag (49 44 33) or MPEG sync (ff fb / ff fa / ff f3 / ff f2)
+  [[ "$magic" == 494433* ]] && return 0
+  [[ "$magic" == fffb* || "$magic" == fffa* || "$magic" == fff3* || "$magic" == fff2* ]] && return 0
+  # FLAC: 66 4c 61 43
+  [[ "$magic" == 664c6143* ]] && return 0
+  # OGG: 4f 67 67 53
+  [[ "$magic" == 4f676753* ]] && return 0
+  # AAC (ADTS): ff f1 / ff f9
+  [[ "$magic" == fff1* || "$magic" == fff9* ]] && return 0
+  # WAV: RIFF (52 49 46 46) + WAVE at offset 8 (57 41 56 45)
+  [[ "$magic" == 52494646* ]] && [[ "${magic:16:8}" == "57415645" ]] && return 0
+  # M4A / AAC in MP4: ftyp box — check bytes 4-7 for 66 74 79 70
+  [[ "${magic:8:8}" == "66747970" ]] && return 0
+  # Fall back to extension
+  local ext="${file##*.}"
+  ext="${ext,,}"
+  [[ "$ext" =~ ^(mp3|wav|flac|ogg|aac|m4a|opus|wma|aiff|ape)$ ]]
+}
+
 # Detect image by magic bytes first, then fall back to extension
 is_image() {
   local file="$1"
@@ -124,6 +148,10 @@ if mode == "image":
         {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
         {'type': 'text', 'text': prompt}
     ]
+elif mode == "audio":
+    # Audio files can't be passed to the LLM directly — metadata was already
+    # injected into the prompt by collect_metadata(), so just forward the prompt.
+    content = prompt
 else:
     with open(file, 'r', errors='replace') as f:
         content = f.read(4000)
@@ -244,6 +272,38 @@ if mode == 'image':
                 if isinstance(val, (str, int, float)):
                     ed[str(tag)] = str(val)[:100]
             if ed: meta['exif'] = ed
+    except Exception:
+        pass
+elif mode == 'audio':
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+             '-show_format', '-show_streams', file],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            probe = json.loads(result.stdout)
+            fmt = probe.get('format', {})
+            tags = fmt.get('tags', {})
+            # Normalise tag keys to lowercase
+            tags = {k.lower(): v for k, v in tags.items()}
+            for key in ('title', 'artist', 'album', 'album_artist', 'date', 'genre', 'track', 'comment'):
+                if tags.get(key):
+                    meta[key] = tags[key][:100]
+            if fmt.get('duration'):
+                secs = float(fmt['duration'])
+                meta['duration'] = f'{int(secs//60)}:{int(secs%60):02d}'
+            if fmt.get('bit_rate'):
+                meta['bitrate_kbps'] = str(int(fmt['bit_rate']) // 1000)
+            # Codec from first audio stream
+            for stream in probe.get('streams', []):
+                if stream.get('codec_type') == 'audio':
+                    if stream.get('codec_name'):
+                        meta['codec'] = stream['codec_name']
+                    if stream.get('sample_rate'):
+                        meta['sample_rate_hz'] = stream['sample_rate']
+                    break
     except Exception:
         pass
 print(json.dumps(meta, ensure_ascii=False))
@@ -734,6 +794,8 @@ process_file() {
   local mode="text"
   if [[ "$force_image" == "true" ]] || is_image "$file"; then
     mode="image"
+  elif is_audio "$file"; then
+    mode="audio"
   fi
 
   if [[ "$mode" == "text" ]] && is_binary "$file"; then
