@@ -1,0 +1,33 @@
+name: bats
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  bats:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install bats + libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            bats bats-assert bats-support \
+            ffmpeg jq
+          # test.sh loads from the Arch-convention path /usr/lib/bats/<lib>/load.
+          # Ubuntu's bats-assert / bats-support packages install their entry
+          # under /usr/lib/bats-assert/ (or /usr/share/bats-assert/ on some
+          # versions). Find each one and symlink so the existing test file
+          # (which Markus runs locally on Arch) doesn't need cross-distro paths.
+          sudo mkdir -p /usr/lib/bats/bats-support /usr/lib/bats/bats-assert
+          support=$(find /usr/lib /usr/share -path '*bats-support/load.bash' -print -quit)
+          assert=$(find /usr/lib /usr/share -path '*bats-assert/load.bash' -print -quit)
+          [ -n "$support" ] && sudo ln -sf "$support" /usr/lib/bats/bats-support/load
+          [ -n "$assert" ]  && sudo ln -sf "$assert"  /usr/lib/bats/bats-assert/load
+          ls -la /usr/lib/bats/bats-support/load /usr/lib/bats/bats-assert/load
+
+      - name: Run bats suite
+        run: bats test.sh
