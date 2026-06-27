@@ -126,6 +126,26 @@ teardown_file() {
   assert_output "second-name.txt"
 }
 
+# Regression: a degenerate model answer (empty / think-only / punctuation) must
+# NOT become a stem-less dotfile like ".jpg" — that slips past the caller's
+# empty-name guard and renames the file to a hidden, stem-less file. Emit
+# nothing so the rename is rejected.
+
+@test "sanitize: empty answer yields no name (not a dotfile)" {
+  run sanitize_name "" "true" "jpg"
+  assert_output ""
+}
+
+@test "sanitize: think-only answer yields no name" {
+  run sanitize_name "<think>spent my whole budget reasoning</think>" "true" "jpg"
+  assert_output ""
+}
+
+@test "sanitize: punctuation-only answer yields no name" {
+  run sanitize_name "." "true" "jpg"
+  assert_output ""
+}
+
 # ── Binary detection ─────────────────────────────────────────────────
 
 @test "binary: text file is not binary" {
