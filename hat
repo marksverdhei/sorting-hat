@@ -527,7 +527,12 @@ name = re.sub(r"-+", "-", name).strip("-")
 if preserve_ext == "true" and orig_ext:
     if "." in name:
         name = name.rsplit(".", 1)[0]
-    name = name + "." + orig_ext
+    name = name.strip("-.")
+    # An empty stem means the model gave nothing usable (e.g. a reasoning model
+    # that spent its budget inside <think> and emitted no answer). Emit no name
+    # so the caller's empty-guard rejects it, instead of renaming the file to a
+    # stem-less dotfile like ".jpg".
+    name = name + "." + orig_ext if name else ""
 print(name)
 SANITIZE
 }
