@@ -29,6 +29,11 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 
 ## Changelog
 
+- Guard against stem-less dotfile rename when the model returns nothing usable (#32)
+- Video file support: MP4, MKV, WebM, AVI, MOV, etc. — named from `ffprobe` metadata (#30)
+- `--preview` / `-p` flag prints a content snippet to stderr before the hat animation (#28)
+- Fix `is_audio` false-positives for MP4 / HEIC / MOV — check ftyp major brand (#27)
+- Audio file support: MP3, WAV, FLAC, OGG, AAC, M4A — named from `ffprobe` tags (#20)
 - Auto-enumerate duplicate filenames in batch mode (#9)
 - Isolate extension from model output for reliable results with small models (#1)
 - `--context` / `-c` flag for guided naming (#2)
