@@ -105,6 +105,29 @@ is_audio() {
   [[ "$ext" =~ ^(mp3|wav|flac|ogg|aac|m4a|opus|wma|aiff|ape)$ ]]
 }
 
+# Detect video by magic bytes first, then fall back to extension
+is_video() {
+  local file="$1"
+  local magic
+  magic=$(head -c 12 "$file" 2>/dev/null | od -A n -t x1 -N 12 2>/dev/null | tr -d ' \n')
+  # MKV / WebM: EBML header 1a 45 df a3
+  [[ "$magic" == 1a45dfa3* ]] && return 0
+  # AVI: RIFF (52 49 46 46) + AVI at offset 8 (41 56 49 20)
+  [[ "$magic" == 52494646* ]] && [[ "${magic:16:8}" == "41564920" ]] && return 0
+  # MP4 / MOV / M4V: ftyp box at bytes 4-7
+  if [[ "${magic:8:8}" == "66747970" ]]; then
+    local brand="${magic:16:8}"
+    # Exclude known audio-only brands (M4A, M4B, M4P)
+    [[ "$brand" != "4d344120" && "$brand" != "4d344220" && "$brand" != "4d345020" ]] && return 0
+  fi
+  # MPEG-1/2 video: 00 00 01 b3 (sequence header) or 00 00 01 ba (pack header)
+  [[ "$magic" == 000001b3* || "$magic" == 000001ba* ]] && return 0
+  # Fall back to extension
+  local ext="${file##*.}"
+  ext="${ext,,}"
+  [[ "$ext" =~ ^(mp4|mkv|avi|mov|webm|m4v|wmv|flv|mpeg|mpg|3gp|ogv|ts|mts|m2ts)$ ]]
+}
+
 # Detect image by magic bytes first, then fall back to extension
 is_image() {
   local file="$1"
@@ -157,9 +180,9 @@ if mode == "image":
         {'type': 'image_url', 'image_url': {'url': f'data:{mime};base64,{b64}'}},
         {'type': 'text', 'text': prompt}
     ]
-elif mode == "audio":
-    # Audio files can't be passed to the LLM directly — metadata was already
-    # injected into the prompt by collect_metadata(), so just forward the prompt.
+elif mode in ("audio", "video"):
+    # Audio/video files can't be passed to the LLM directly — metadata was
+    # already injected into the prompt by collect_metadata().
     content = prompt
 else:
     with open(file, 'r', errors='replace') as f:
@@ -383,6 +406,41 @@ elif mode == 'audio':
                         meta['codec'] = stream['codec_name']
                     if stream.get('sample_rate'):
                         meta['sample_rate_hz'] = stream['sample_rate']
+                    break
+    except Exception:
+        pass
+elif mode == 'video':
+    import subprocess
+    try:
+        result = subprocess.run(
+            ['ffprobe', '-v', 'quiet', '-print_format', 'json',
+             '-show_format', '-show_streams', file],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            probe = json.loads(result.stdout)
+            fmt = probe.get('format', {})
+            tags = {k.lower(): v for k, v in fmt.get('tags', {}).items()}
+            for key in ('title', 'comment', 'date', 'artist', 'album'):
+                if tags.get(key):
+                    meta[key] = tags[key][:100]
+            if fmt.get('duration'):
+                secs = float(fmt['duration'])
+                meta['duration'] = f'{int(secs//60)}:{int(secs%60):02d}'
+            if fmt.get('bit_rate'):
+                meta['bitrate_kbps'] = str(int(fmt['bit_rate']) // 1000)
+            for stream in probe.get('streams', []):
+                if stream.get('codec_type') == 'video':
+                    if stream.get('codec_name'):
+                        meta['video_codec'] = stream['codec_name']
+                    if stream.get('width') and stream.get('height'):
+                        meta['resolution'] = str(stream['width']) + 'x' + str(stream['height'])
+                    if stream.get('avg_frame_rate'):
+                        fr = stream['avg_frame_rate']
+                        if '/' in fr:
+                            n, d = fr.split('/')
+                            if int(d) > 0:
+                                meta['fps'] = str(round(int(n) / int(d), 2))
                     break
     except Exception:
         pass
@@ -876,6 +934,8 @@ process_file() {
     mode="image"
   elif is_audio "$file"; then
     mode="audio"
+  elif is_video "$file"; then
+    mode="video"
   fi
 
   if [[ "$mode" == "text" ]] && is_binary "$file"; then
