@@ -43,8 +43,9 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 ## Features
 
 - Animated Sorting Hat with drop animation, blinking eyes, and streaming thought bubble
-- Supports text files, images (JPEG, PNG, GIF, BMP, TIFF, WebP, SVG), and audio files (MP3, WAV, FLAC, OGG, AAC, M4A)
-- Auto-detects image and audio files by magic bytes and extension
+- Supports text files, images (JPEG, PNG, GIF, BMP, TIFF, WebP, SVG), audio (MP3, WAV, FLAC, OGG, AAC, M4A, …), and video (MP4, MKV, WebM, AVI, MOV, …)
+- Auto-detects image / audio / video files by magic bytes and extension
+- `--preview` / `-p` to print a content snippet to stderr before the hat animation
 - Handles reasoning/thinking tokens from models like Qwen, DeepSeek, etc.
 - Quiet mode for scripting (`--quiet` / `-q`)
 - Configurable reasoning: guard clause defaults to no thinking, naming uses thinking. `--nothink` disables both, `--fullthink` enables both
@@ -63,10 +64,9 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 | **Images** (JPEG, PNG, SVG) | Base64-encoded and sent via the multimodal API |
 | **Images** (WebP, BMP, TIFF, GIF) | Converted to PNG via Pillow, then sent as above |
 | **Audio** (MP3, FLAC, OGG, AAC, WAV, M4A, Opus, WMA, AIFF, APE) | Not sent to the LLM directly — named from embedded tags (title/artist/album/genre/date + duration) read via `ffprobe` |
+| **Video** (MP4, MKV, WebM, AVI, MOV, M4V, WMV, FLV, MPEG, MPG, 3GP, OGV, TS, MTS, M2TS) | Not sent to the LLM directly — named from `ffprobe` metadata (codec, duration, resolution, container tags) |
 
-Video and other binary files are not supported.
-
-Image naming requires a vision-capable model (e.g. `llava`). Audio naming requires `ffprobe` (from FFmpeg) for tag extraction; images additionally include any EXIF metadata in the prompt.
+Image naming requires a vision-capable model (e.g. `llava`). Audio and video naming require `ffprobe` (from FFmpeg) for metadata extraction; images additionally include any EXIF metadata in the prompt.
 
 ## Requirements
 
@@ -180,6 +180,9 @@ hat --batch --force ~/Downloads/
 
 # Skip metadata collection
 hat --no-metadata photo.jpg
+
+# Preview file content on stderr before the animation runs
+hat --preview document.txt
 ```
 
 ### Scripting
