@@ -55,6 +55,19 @@ Works with any OpenAI-compatible API: local servers (llama.cpp, Ollama, vLLM, LM
 - Interactive rename with confirmation (`--yes` / `-y` to auto-rename without prompting)
 - Robust extension handling: isolates name stem from extension for reliable results with smaller models
 
+## Supported Formats
+
+| Format | How it works |
+|--------|-------------|
+| **Text files** (.txt, .md, .py, .json, .csv, .xml, .html, etc.) | First 4000 characters of content sent to the LLM |
+| **Images** (JPEG, PNG, SVG) | Base64-encoded and sent via the multimodal API |
+| **Images** (WebP, BMP, TIFF, GIF) | Converted to PNG via Pillow, then sent as above |
+| **Audio** (MP3, FLAC, OGG, AAC, WAV, M4A, Opus, WMA, AIFF, APE) | Not sent to the LLM directly — named from embedded tags (title/artist/album/genre/date + duration) read via `ffprobe` |
+
+Video and other binary files are not supported.
+
+Image naming requires a vision-capable model (e.g. `llava`). Audio naming requires `ffprobe` (from FFmpeg) for tag extraction; images additionally include any EXIF metadata in the prompt.
+
 ## Requirements
 
 - Bash 4+
